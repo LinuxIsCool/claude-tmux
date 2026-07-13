@@ -1,0 +1,4 @@
+node_modules/
+src/web/dist/
+__pycache__/
+*.pyc

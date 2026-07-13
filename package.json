@@ -1,0 +1,25 @@
+{
+  "name": "claude-tmux-webui",
+  "version": "0.1.0",
+  "description": "Fractal session/window/pane visualizer for claude-tmux",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch run src/cli.ts serve",
+    "serve": "bun run src/cli.ts serve",
+    "topology": "bun run src/cli.ts topology",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "author": "Legion",
+  "license": "MIT"
+}

@@ -1,0 +1,99 @@
+{
+  "name": "catppuccin-mocha",
+  "description": "Legion visual tokens — single source of truth for colors, glyphs, and persona identity across all interfaces",
+  "semantic_colors": {
+    "active": "#a6e3a1",
+    "ready": "#89b4fa",
+    "delegated": "#cba6f7",
+    "attention": "#f9e2af",
+    "error": "#f38ba8",
+    "info": "#89dceb",
+    "unread": "#b4befe",
+    "nudge": "#6699cc",
+    "muted": "#6c7086"
+  },
+  "states": {
+    "working": {
+      "semantic": "active",
+      "glyph": "⬤",
+      "label": "Claude is generating"
+    },
+    "idle": {
+      "semantic": "ready",
+      "glyph": "⬤",
+      "label": "Awaiting input"
+    },
+    "agents": {
+      "semantic": "delegated",
+      "glyph": "◉",
+      "label": "Subagent active"
+    },
+    "asking": {
+      "semantic": "attention",
+      "glyph": "?",
+      "label": "Waiting for user"
+    },
+    "error": {
+      "semantic": "error",
+      "glyph": "!",
+      "label": "Error / rate limit"
+    },
+    "unread": {
+      "semantic": "unread",
+      "glyph": "⬥",
+      "label": "Response ready (unread)"
+    },
+    "nudge": {
+      "semantic": "nudge",
+      "glyph": "⬤",
+      "label": "Idle nudge"
+    }
+  },
+  "hook_to_state": {
+    "SessionStart": "idle",
+    "SessionEnd": "clear",
+    "UserPromptSubmit": "working",
+    "Stop": "idle",
+    "StopFailure": "error",
+    "PreToolUse": "working",
+    "PostToolUseFailure": "error",
+    "PermissionRequest": "asking",
+    "SubagentStart": "agents",
+    "SubagentStop": "working",
+    "TeammateIdle": "idle",
+    "TaskCompleted": "idle",
+    "PreCompact": "working",
+    "PostCompact": "idle"
+  },
+  "notification_states": {
+    "permission_prompt": "asking",
+    "idle_prompt": "idle",
+    "auth_success": "idle",
+    "elicitation_dialog": "asking"
+  },
+  "personas": {
+    "claude": {
+      "emoji": "✨",
+      "label": "Claude"
+    },
+    "alice": {
+      "emoji": "🌱",
+      "label": "Example persona"
+    },
+    "bob": {
+      "emoji": "🔭",
+      "label": "Example persona"
+    }
+  },
+  "segment_order": [
+    "persona",
+    "voice",
+    "focus",
+    "hook"
+  ],
+  "session_list": {
+    "active_fg": "#fffafa",
+    "inactive_fg": "#626262",
+    "separator": " "
+  }
+}

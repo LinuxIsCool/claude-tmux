@@ -1,0 +1,11 @@
+{
+  "_comment": "Optional overrides for tmux-arbiter. Hot-reload: kill -HUP $(cat ~/.claude/local/tmux/arbiter.pid)",
+  "reconcile_interval": 15.0,
+  "stale_working_mins": 2.0,
+  "startup_guard_secs": 2.0,
+  "holdoff_secs": 6.0,
+  "hook_emoji_slots": 1,
+  "focus_decay_half_life_file": 120.0,
+  "focus_decay_half_life_cwd": 600.0,
+  "focus_decay_half_life_intent": 300.0
+}

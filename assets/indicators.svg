@@ -1,0 +1,68 @@
+<svg class="rich-terminal" viewBox="0 0 1348 74.4" xmlns="http://www.w3.org/2000/svg">
+    <!-- Generated with Rich https://www.textualize.io -->
+    <style>
+
+    @font-face {
+        font-family: "Fira Code";
+        src: local("FiraCode-Regular"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff2/FiraCode-Regular.woff2") format("woff2"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff/FiraCode-Regular.woff") format("woff");
+        font-style: normal;
+        font-weight: 400;
+    }
+    @font-face {
+        font-family: "Fira Code";
+        src: local("FiraCode-Bold"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff2/FiraCode-Bold.woff2") format("woff2"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff/FiraCode-Bold.woff") format("woff");
+        font-style: bold;
+        font-weight: 700;
+    }
+
+    .terminal-2009698954-matrix {
+        font-family: Fira Code, monospace;
+        font-size: 20px;
+        line-height: 24.4px;
+        font-variant-east-asian: full-width;
+    }
+
+    .terminal-2009698954-title {
+        font-size: 18px;
+        font-weight: bold;
+        font-family: arial;
+    }
+
+    .terminal-2009698954-r1 { fill: #cdd6f4;font-weight: bold }
+.terminal-2009698954-r2 { fill: #6c7086 }
+.terminal-2009698954-r3 { fill: #c5c8c6 }
+.terminal-2009698954-r4 { fill: #a6e3a1 }
+.terminal-2009698954-r5 { fill: #cdd6f4 }
+.terminal-2009698954-r6 { fill: #89b4fa }
+.terminal-2009698954-r7 { fill: #b4befe }
+.terminal-2009698954-r8 { fill: #cba6f7 }
+.terminal-2009698954-r9 { fill: #f9e2af }
+.terminal-2009698954-r10 { fill: #f38ba8 }
+    </style>
+
+    <defs>
+    <clipPath id="terminal-2009698954-clip-terminal">
+      <rect x="0" y="0" width="1328.8" height="23.4" />
+    </clipPath>
+    
+    </defs>
+
+    <rect fill="#292929" stroke="rgba(255,255,255,0.35)" stroke-width="1" x="1" y="1" width="1346" height="72.4" rx="8"/><text class="terminal-2009698954-title" fill="#c5c8c6" text-anchor="middle" x="673" y="27">claude-tmux:&#160;window&#160;tab&#160;indicators</text>
+            <g transform="translate(26,22)">
+            <circle cx="0" cy="0" r="7" fill="#ff5f57"/>
+            <circle cx="22" cy="0" r="7" fill="#febc2e"/>
+            <circle cx="44" cy="0" r="7" fill="#28c840"/>
+            </g>
+        
+    <g transform="translate(9, 41)" clip-path="url(#terminal-2009698954-clip-terminal)">
+    
+    <g class="terminal-2009698954-matrix">
+    <text class="terminal-2009698954-r1" x="0" y="20" textLength="97.6" clip-path="url(#terminal-2009698954-line-0)">✨&#160;demo&#160;&#160;</text><text class="terminal-2009698954-r2" x="109.8" y="20" textLength="109.8" clip-path="url(#terminal-2009698954-line-0)">✨&#160;notes&#160;&#160;</text><text class="terminal-2009698954-r4" x="268.4" y="20" textLength="12.2" clip-path="url(#terminal-2009698954-line-0)">⬤</text><text class="terminal-2009698954-r5" x="292.8" y="20" textLength="146.4" clip-path="url(#terminal-2009698954-line-0)">1:api-server</text><text class="terminal-2009698954-r6" x="475.8" y="20" textLength="12.2" clip-path="url(#terminal-2009698954-line-0)">⬤</text><text class="terminal-2009698954-r5" x="500.2" y="20" textLength="73.2" clip-path="url(#terminal-2009698954-line-0)">2:docs</text><text class="terminal-2009698954-r7" x="610" y="20" textLength="12.2" clip-path="url(#terminal-2009698954-line-0)">⬥</text><text class="terminal-2009698954-r5" x="634.4" y="20" textLength="122" clip-path="url(#terminal-2009698954-line-0)">3:refactor</text><text class="terminal-2009698954-r8" x="793" y="20" textLength="12.2" clip-path="url(#terminal-2009698954-line-0)">◉</text><text class="terminal-2009698954-r5" x="817.4" y="20" textLength="122" clip-path="url(#terminal-2009698954-line-0)">4:research</text><text class="terminal-2009698954-r9" x="976" y="20" textLength="12.2" clip-path="url(#terminal-2009698954-line-0)">?</text><text class="terminal-2009698954-r5" x="1000.4" y="20" textLength="97.6" clip-path="url(#terminal-2009698954-line-0)">5:deploy</text><text class="terminal-2009698954-r10" x="1134.6" y="20" textLength="12.2" clip-path="url(#terminal-2009698954-line-0)">!</text><text class="terminal-2009698954-r5" x="1159" y="20" textLength="134.2" clip-path="url(#terminal-2009698954-line-0)">6:migration</text><text class="terminal-2009698954-r3" x="1329.8" y="20" textLength="12.2" clip-path="url(#terminal-2009698954-line-0)">
+</text>
+    </g>
+    </g>
+</svg>

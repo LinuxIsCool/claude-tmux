@@ -1,0 +1,17 @@
+{
+  "name": "claude-tmux",
+  "owner": {
+    "name": "LinuxIsCool"
+  },
+  "metadata": {
+    "description": "Marketplace for the claude-tmux plugin",
+    "version": "1.2.0"
+  },
+  "plugins": [
+    {
+      "name": "claude-tmux",
+      "source": "./",
+      "description": "Live activity indicators in tmux window tabs for Claude Code sessions: daemon-owned state machine, persona/focus/hook-emoji segments, and session resurrection via tmux-resurrect"
+    }
+  ]
+}
