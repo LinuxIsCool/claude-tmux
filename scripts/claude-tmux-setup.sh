@@ -136,14 +136,17 @@ DYNEOF
 # pane @claude_state -> window @claude_window_state -> empty.
 WINDOW_STATE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/tmux-window-state.sh"
 if [ -f "$WINDOW_STATE_SCRIPT" ]; then
-    # Guard against accumulation: only add if not already registered.
-    if ! tmux show-hooks -g 2>/dev/null | grep -q "tmux-window-state.sh"; then
-        # after-select-pane: fires on pane switch within a window
-        tmux set-hook -ga after-select-pane "run-shell -b '$WINDOW_STATE_SCRIPT'"
-        # after-select-window: fires on window switch — needed for unread→read
-        # (visiting an unread window via Ctrl-B N doesn't trigger after-select-pane)
-        tmux set-hook -ga after-select-window "run-shell -b '$WINDOW_STATE_SCRIPT'"
-    fi
+    # Unconditional re-registration: unset then set on every run, so a stale
+    # path from a prior install location can never survive a re-run. A
+    # "only if not already registered" guard here previously masked exactly
+    # that case after the 2026-07-13 graduation to ~/Workspace/claude-tmux.
+    tmux set-hook -gu after-select-pane 2>/dev/null
+    tmux set-hook -gu after-select-window 2>/dev/null
+    # after-select-pane: fires on pane switch within a window
+    tmux set-hook -ga after-select-pane "run-shell -b '$WINDOW_STATE_SCRIPT'"
+    # after-select-window: fires on window switch — needed for unread→read
+    # (visiting an unread window via Ctrl-B N doesn't trigger after-select-pane)
+    tmux set-hook -ga after-select-window "run-shell -b '$WINDOW_STATE_SCRIPT'"
 fi
 
 # Self-healing: clear stale indicators when a pane's process dies
@@ -164,16 +167,20 @@ tmux set-hook -g pane-died 'if -F "#{@claude_state}" "set -pu @claude_state ; se
 # Pane-level events matter because pane_index renumbers when sibling panes
 # are added/removed within the same window.
 #
-# Registration guard: use a global tmux user option as a marker rather than
-# string-matching the hook output. Survives path changes between runs.
+# Unconditional re-registration on every run (see rationale above the
+# after-select-pane/-window block): the previous marker-option guard
+# (@claude_resave_hooks_installed) recorded only that registration had
+# happened once, never whether the registered path was still valid, so it
+# masked a stale post-graduation path indefinitely. Some event names below
+# are not recognized by every tmux version ("invalid option"); that's
+# expected and harmless, so stderr is discarded for both the clear and the
+# re-register pass.
 RESAVE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/claude-resave-state.sh"
 if [ -f "$RESAVE_SCRIPT" ]; then
-    if [ -z "$(tmux show-option -gv @claude_resave_hooks_installed 2>/dev/null)" ]; then
-        for evt in after-kill-window after-renumber-window after-rename-window \
-                   after-swap-window after-move-window after-link-window \
-                   after-unlink-window after-split-window pane-exited; do
-            tmux set-hook -ga "$evt" "run-shell -b '$RESAVE_SCRIPT'"
-        done
-        tmux set-option -g @claude_resave_hooks_installed "1"
-    fi
+    for evt in after-kill-window after-renumber-window after-rename-window \
+               after-swap-window after-move-window after-link-window \
+               after-unlink-window after-split-window pane-exited; do
+        tmux set-hook -gu "$evt" 2>/dev/null
+        tmux set-hook -ga "$evt" "run-shell -b '$RESAVE_SCRIPT'" 2>/dev/null
+    done
 fi
