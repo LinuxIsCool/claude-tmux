@@ -37,7 +37,21 @@ build_segments() {
     local result=""
     for seg in $segments; do
         local var="@claude_${prefix}${seg}"
-        result="${result}#{?#{${var}},#{${var}},}"
+        if [ "$prefix" = "" ] && [ "$seg" = "voice" ]; then
+            # window-status-format renders in the ACTIVE pane's context, so the
+            # pane branch shows the active pane's icon for the whole tab. A
+            # window running Claude in two panes would hide the speaking star
+            # whenever the speaker was not the active pane — invisible by
+            # construction, not a race (found 2026-08-05).
+            #
+            # Voice is a window-scoped question: "is anyone in this tab
+            # talking?" voice_arbiter.py mirrors the highest-priority state of
+            # a window's panes into @claude_window_voice, so prefer it and fall
+            # back to the pane option when it is unset.
+            result="${result}#{?#{@claude_window_voice},#{@claude_window_voice},#{?#{${var}},#{${var}},}}"
+        else
+            result="${result}#{?#{${var}},#{${var}},}"
+        fi
     done
     echo "#[fg=#{@claude_${prefix}color}]#{@claude_${prefix}state}#[fg=${fg_restore}]${result} "
 }
