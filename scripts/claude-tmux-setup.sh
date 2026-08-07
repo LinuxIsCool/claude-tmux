@@ -27,6 +27,10 @@ THEME_FILE="$(cd "$(dirname "$0")/.." && pwd)/theme.json"
 build_segments() {
     local prefix="$1"  # "" for pane-level, "window_" for window-level
     local fg_restore="$2"  # color to restore after state dot
+    local voice_pane_first="$3"  # "1" => prefer this pane's own @claude_voice
+                                  # (window-status-current-format only); unset
+                                  # (or anything else) => prefer the window
+                                  # aggregate, @claude_window_voice
 
     local segments=""
     if [ -f "$THEME_FILE" ] && command -v jq >/dev/null 2>&1; then
@@ -38,17 +42,26 @@ build_segments() {
     for seg in $segments; do
         local var="@claude_${prefix}${seg}"
         if [ "$prefix" = "" ] && [ "$seg" = "voice" ]; then
-            # window-status-format renders in the ACTIVE pane's context, so the
-            # pane branch shows the active pane's icon for the whole tab. A
-            # window running Claude in two panes would hide the speaking star
-            # whenever the speaker was not the active pane — invisible by
-            # construction, not a race (found 2026-08-05).
+            # window-status-format renders in the ACTIVE pane's context. Voice
+            # is a window-scoped question for every OTHER window in the status
+            # bar ("is anyone in this tab talking?"), so window-status-format
+            # keeps preferring the aggregate @claude_window_voice (mirrored by
+            # voice_arbiter.py) and falls back to this pane's own option when
+            # unset (found 2026-08-05).
             #
-            # Voice is a window-scoped question: "is anyone in this tab
-            # talking?" voice_arbiter.py mirrors the highest-priority state of
-            # a window's panes into @claude_window_voice, so prefer it and fall
-            # back to the pane option when it is unset.
-            result="${result}#{?#{@claude_window_voice},#{@claude_window_voice},#{?#{${var}},#{${var}},}}"
+            # But for the CURRENT window — the one you're looking at —
+            # rendering always resolves against the ACTIVE pane. Preferring
+            # the aggregate there means every pane you select shows the same
+            # window-wide star, so you can't tell which pane is actually
+            # speaking. window-status-current-format instead prefers the
+            # active pane's own @claude_voice first, falling back to the
+            # window aggregate only when this pane has no voice state of its
+            # own (found 2026-08-06).
+            if [ "$voice_pane_first" = "1" ]; then
+                result="${result}#{?#{${var}},#{${var}},#{?#{@claude_window_voice},#{@claude_window_voice},}}"
+            else
+                result="${result}#{?#{@claude_window_voice},#{@claude_window_voice},#{?#{${var}},#{${var}},}}"
+            fi
         else
             result="${result}#{?#{${var}},#{${var}},}"
         fi
@@ -92,7 +105,7 @@ BASE_WSCF=$(strip_claude_indicator "$CURRENT_WSCF")
 CURRENT_FG=$(echo "$BASE_WSCF" | sed 's/#I.*//' | grep -oP 'fg=#[0-9a-fA-F]{6}' | tail -1 | cut -d= -f2)
 CURRENT_FG="${CURRENT_FG:-default}"
 
-PANE_IND_CUR=$(build_segments "" "$CURRENT_FG")
+PANE_IND_CUR=$(build_segments "" "$CURRENT_FG" "1")
 WIN_IND_CUR=$(build_segments "window_" "$CURRENT_FG")
 INDICATOR_CURRENT="#{?#{@claude_state},${PANE_IND_CUR},#{?#{@claude_window_state},${WIN_IND_CUR}, }}"
 
