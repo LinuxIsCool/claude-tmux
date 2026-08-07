@@ -157,23 +157,46 @@ DYNEOF
 
 # --- END format string injection ---
 
+# --- Hook re-registration helper ---
+# `tmux set-hook -gu <event>` (no index) unsets EVERY hook registered for
+# that event, from every plugin sharing it — not just claude-tmux's own.
+# claude-voice registers a focus hook (tmux_focus_hook.sh) on
+# after-select-pane / after-select-window / client-focus-in to track which
+# pane the operator is looking at, so the voice arbiter knows where to route
+# audio. A blanket unset here silently deletes claude-voice's entry with no
+# error and no log line — focus mode is left watching a stale/wrong pane
+# while playback goes nowhere. This exact failure cost an evening to
+# diagnose (2026-08-06). Do not "simplify" this back to a bare
+# `set-hook -gu <event>`.
+#
+# Fix: read `tmux show-hooks -g`, find only the index(es) whose command
+# references OUR OWN script (by basename, so a stale path from a prior
+# install location still gets cleaned up — same idempotency goal as the old
+# unconditional unset), and unset just those before appending the current
+# command. Any other plugin's hook on the same event is left untouched.
+reinstall_own_hook() {
+    local event="$1" cmd="$2" script_path="$3" script_basename
+    script_basename="$(basename "$script_path")"
+    local idx
+    for idx in $(tmux show-hooks -g 2>/dev/null \
+                 | grep -F "$script_basename" \
+                 | grep -oP "^${event}\[\K[0-9]+(?=\])"); do
+        tmux set-hook -gu "${event}[${idx}]" 2>/dev/null
+    done
+    tmux set-hook -ga "$event" "$cmd" 2>/dev/null
+}
+
 # --- Split-pane indicator preservation ---
 # When focus moves between panes, scan the window for any Claude pane and copy
 # its state to window-level fallback options. The format string cascades:
 # pane @claude_state -> window @claude_window_state -> empty.
 WINDOW_STATE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/tmux-window-state.sh"
 if [ -f "$WINDOW_STATE_SCRIPT" ]; then
-    # Unconditional re-registration: unset then set on every run, so a stale
-    # path from a prior install location can never survive a re-run. A
-    # "only if not already registered" guard here previously masked exactly
-    # that case after the 2026-07-13 graduation to ~/Workspace/claude-tmux.
-    tmux set-hook -gu after-select-pane 2>/dev/null
-    tmux set-hook -gu after-select-window 2>/dev/null
     # after-select-pane: fires on pane switch within a window
-    tmux set-hook -ga after-select-pane "run-shell -b '$WINDOW_STATE_SCRIPT'"
+    reinstall_own_hook after-select-pane "run-shell -b '$WINDOW_STATE_SCRIPT'" "$WINDOW_STATE_SCRIPT"
     # after-select-window: fires on window switch — needed for unread→read
     # (visiting an unread window via Ctrl-B N doesn't trigger after-select-pane)
-    tmux set-hook -ga after-select-window "run-shell -b '$WINDOW_STATE_SCRIPT'"
+    reinstall_own_hook after-select-window "run-shell -b '$WINDOW_STATE_SCRIPT'" "$WINDOW_STATE_SCRIPT"
 fi
 
 # Self-healing: clear stale indicators when a pane's process dies
@@ -194,20 +217,22 @@ tmux set-hook -g pane-died 'if -F "#{@claude_state}" "set -pu @claude_state ; se
 # Pane-level events matter because pane_index renumbers when sibling panes
 # are added/removed within the same window.
 #
-# Unconditional re-registration on every run (see rationale above the
-# after-select-pane/-window block): the previous marker-option guard
-# (@claude_resave_hooks_installed) recorded only that registration had
-# happened once, never whether the registered path was still valid, so it
-# masked a stale post-graduation path indefinitely. Some event names below
-# are not recognized by every tmux version ("invalid option"); that's
-# expected and harmless, so stderr is discarded for both the clear and the
-# re-register pass.
+# Re-registration on every run (see rationale on reinstall_own_hook above):
+# the previous marker-option guard (@claude_resave_hooks_installed) recorded
+# only that registration had happened once, never whether the registered
+# path was still valid, so it masked a stale post-graduation path
+# indefinitely. We still want that idempotency, but via reinstall_own_hook
+# rather than a blanket `set-hook -gu <event>` — any of these nine events
+# could just as easily end up shared with another plugin's hook later, and
+# a bare unset would delete it exactly the way it deleted claude-voice's
+# focus hook on after-select-pane/-window (see above). Some event names
+# below are not recognized by every tmux version ("invalid option"); that's
+# expected and harmless, so stderr is discarded throughout.
 RESAVE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/claude-resave-state.sh"
 if [ -f "$RESAVE_SCRIPT" ]; then
     for evt in after-kill-window after-renumber-window after-rename-window \
                after-swap-window after-move-window after-link-window \
                after-unlink-window after-split-window pane-exited; do
-        tmux set-hook -gu "$evt" 2>/dev/null
-        tmux set-hook -ga "$evt" "run-shell -b '$RESAVE_SCRIPT'" 2>/dev/null
+        reinstall_own_hook "$evt" "run-shell -b '$RESAVE_SCRIPT'" "$RESAVE_SCRIPT"
     done
 fi
