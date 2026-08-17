@@ -73,6 +73,59 @@ THEME_PATH = _LOCAL_THEME if _LOCAL_THEME.is_file() else _PLUGIN_THEME
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 LOCAL_CONFIG_PATH = Path.home() / ".claude" / "local" / "tmux" / "config.json"
 
+# ---------------------------------------------------------------------------
+# tmux socket resolution
+# ---------------------------------------------------------------------------
+# A bare `tmux` client takes its socket from $TMUX and, when that is unset,
+# falls back to the socket named "default". Hook scripts run inside a pane and
+# inherit a correct $TMUX, so they were never affected. This daemon is started
+# by systemd with a bare environment. When the sessions moved onto
+# `tmux -L persist` (tmux-persist.service, added so tmux survives a compositor
+# crash), every call here began connecting to /tmp/tmux-$UID/default — a server
+# that does not exist. Nothing raised: the option writes failed, pane_exists()
+# reported every live pane as dead, and the tab indicators silently went blank
+# while the log still showed correctly-computed emoji. Resolve it explicitly.
+
+def _resolve_tmux_socket() -> tuple[str, str]:
+    """Pick which tmux server to talk to. Returns (socket_name, reason).
+
+    An empty socket name means "invoke tmux bare and let it decide".
+    """
+    override = os.environ.get("CLAUDE_TMUX_SOCKET", "").strip()
+    if override:
+        return override, "CLAUDE_TMUX_SOCKET"
+
+    # Launched inside tmux — inherit that server. $TMUX is "<path>,<pid>,<session>".
+    tmux_env = os.environ.get("TMUX", "").strip()
+    if tmux_env:
+        return Path(tmux_env.split(",")[0]).name, "$TMUX"
+
+    # Daemon case: no ambient tmux. Ask the filesystem which servers exist.
+    sock_dir = Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}"
+    try:
+        live = sorted(p.name for p in sock_dir.iterdir() if p.is_socket())
+    except OSError:
+        live = []
+    if len(live) == 1:
+        return live[0], f"only socket in {sock_dir}"
+    for preferred in ("persist", "default"):
+        if preferred in live:
+            return preferred, f"preferred among {live}"
+    return "", f"unresolved (found {live or 'no sockets'})"
+
+
+TMUX_SOCKET, TMUX_SOCKET_REASON = _resolve_tmux_socket()
+TMUX_CMD: list[str] = ["tmux"] + (["-L", TMUX_SOCKET] if TMUX_SOCKET else [])
+
+
+class TmuxUnreachable(RuntimeError):
+    """The tmux server could not be contacted.
+
+    Distinct from "tmux answered and said no". Reconciliation must treat this as
+    "I don't know" and change nothing, never as "every pane is gone".
+    """
+
+
 @dataclass
 class Config:
     """Tuning constants for the arbiter. Loaded from config.json, hot-reloaded on SIGHUP."""
@@ -570,10 +623,16 @@ class FocusEngine:
         venture_key = ""
         plugin_key = ""
 
-        # 1. Exact plugin: claude-{name}
-        if window_name.startswith("claude-"):
-            if self.emoji.get(f"plugin:{window_name}"):
-                plugin_key = f"plugin:{window_name}"
+        # 1. Exact plugin. Codex windows share the claude-* plugin ontology:
+        # codex-legion-logging -> plugin:claude-logging.
+        plugin_name = window_name
+        if window_name.startswith("codex-legion-"):
+            plugin_name = "claude-" + window_name.removeprefix("codex-legion-")
+        elif window_name.startswith("codex-"):
+            plugin_name = "claude-" + window_name.removeprefix("codex-")
+        if plugin_name.startswith("claude-"):
+            if self.emoji.get(f"plugin:{plugin_name}"):
+                plugin_key = f"plugin:{plugin_name}"
 
         # 2. Plugin alias: short name → claude-{full} (case-insensitive)
         if not plugin_key:
@@ -849,7 +908,7 @@ def detect_pane_cpu_active(pane_id: str) -> bool | None:
     """
     try:
         pid_r = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
+            [*TMUX_CMD, "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
             capture_output=True, timeout=0.5,
         )
         if pid_r.returncode != 0:
@@ -889,7 +948,7 @@ def detect_tool_execution(pane_id: str) -> bool | None:
     """
     try:
         pid_r = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
+            [*TMUX_CMD, "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
             capture_output=True, timeout=0.5,
         )
         if pid_r.returncode != 0:
@@ -937,7 +996,7 @@ def detect_pane_persona(pane_id: str) -> str:
     """
     try:
         pid_r = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
+            [*TMUX_CMD, "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
             capture_output=True, timeout=0.5,
         )
         if pid_r.returncode != 0:
@@ -983,6 +1042,8 @@ class PaneState:
     focus_plugin: str = ""   # plugin signal key (e.g. "plugin:claude-voice") or ""
     window_name: str = ""    # cached tmux window name (queried on SessionStart)
     focus_signals: list = field(default_factory=list)  # list of FocusSignal dicts for persistence
+    provider: str = "claude"  # event adapter that owns lifecycle semantics
+    active_agent_count: int = 0  # Codex subagents are an orthogonal decoration
 
 
 # ---------------------------------------------------------------------------
@@ -1100,34 +1161,43 @@ class TmuxWriter:
         NEVER clears @claude_persona if pane.persona is "" — preserves existing.
         """
         t = pane.pane_id
-        cls._run(["tmux", "set", "-p", "-t", t, "@claude_state", pane.glyph])
-        cls._run(["tmux", "set", "-p", "-t", t, "@claude_color", pane.color])
+        cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_state", pane.glyph])
+        cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_color", pane.color])
         if pane.persona:
-            cls._run(["tmux", "set", "-p", "-t", t, "@claude_persona", pane.persona])
+            cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_persona", pane.persona])
         else:
             # Explicitly clear if persona is empty — removes stale/incorrect emoji
-            cls._run(["tmux", "set", "-pu", "-t", t, "@claude_persona"])
+            cls._run([*TMUX_CMD, "set", "-pu", "-t", t, "@claude_persona"])
         # Update window-level fallback for split-pane indicator preservation.
         # This ensures the window tab shows the latest state even if a non-Claude
         # pane is focused. The after-select-pane hook also updates these, but the
         # arbiter keeps them fresh on every state change for immediate feedback.
-        cls._run(["tmux", "set", "-w", "-t", t, "@claude_window_state", pane.glyph])
-        cls._run(["tmux", "set", "-w", "-t", t, "@claude_window_color", pane.color])
+        cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_state", pane.glyph])
+        cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_color", pane.color])
         if pane.persona:
-            cls._run(["tmux", "set", "-w", "-t", t, "@claude_window_persona", pane.persona])
+            cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_persona", pane.persona])
         # Hook emoji — shows last event + optional tool refinement.
         # Only write when non-empty; never clear (preserves last-known emoji).
         # Cleared explicitly on SessionEnd via clear_state().
         if pane.hook_emoji:
-            cls._run(["tmux", "set", "-p", "-t", t, "@claude_hook", pane.hook_emoji])
-            cls._run(["tmux", "set", "-w", "-t", t, "@claude_window_hook", pane.hook_emoji])
+            cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_hook", pane.hook_emoji])
+            cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_hook", pane.hook_emoji])
         # Focus emoji — venture/plugin indicator from cwd.
         if pane.focus_emoji:
-            cls._run(["tmux", "set", "-p", "-t", t, "@claude_focus", pane.focus_emoji])
-            cls._run(["tmux", "set", "-w", "-t", t, "@claude_window_focus", pane.focus_emoji])
+            cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_focus", pane.focus_emoji])
+            cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_focus", pane.focus_emoji])
         else:
-            cls._run(["tmux", "set", "-pu", "-t", t, "@claude_focus"])
-            cls._run(["tmux", "set", "-wu", "-t", t, "@claude_window_focus"])
+            cls._run([*TMUX_CMD, "set", "-pu", "-t", t, "@claude_focus"])
+            cls._run([*TMUX_CMD, "set", "-wu", "-t", t, "@claude_window_focus"])
+        # Codex delegation is orthogonal to the parent's operational state.
+        # Render it as a separate segment rather than replacing working/asking.
+        if pane.active_agent_count > 0:
+            glyph = "◉" if pane.active_agent_count == 1 else f"◉{pane.active_agent_count}"
+            cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_agents", glyph])
+            cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_agents", glyph])
+        else:
+            cls._run([*TMUX_CMD, "set", "-pu", "-t", t, "@claude_agents"])
+            cls._run([*TMUX_CMD, "set", "-wu", "-t", t, "@claude_window_agents"])
 
     @classmethod
     def clear_state(cls, pane_id: str) -> None:
@@ -1137,12 +1207,12 @@ class TmuxWriter:
         the first match to window-level options. Otherwise clears them.
         Also clears @claude_voice — session is gone, no voice state to show.
         """
-        for opt in ("@claude_state", "@claude_color", "@claude_persona", "@claude_hook", "@claude_voice", "@claude_focus"):
-            cls._run(["tmux", "set", "-pu", "-t", pane_id, opt])
+        for opt in ("@claude_state", "@claude_color", "@claude_persona", "@claude_hook", "@claude_voice", "@claude_focus", "@claude_agents"):
+            cls._run([*TMUX_CMD, "set", "-pu", "-t", pane_id, opt])
         # Check if any sibling pane still has claude state
         try:
             r = subprocess.run(
-                ["tmux", "list-panes", "-t", pane_id, "-F",
+                [*TMUX_CMD, "list-panes", "-t", pane_id, "-F",
                  "#{pane_id}\t#{@claude_state}\t#{@claude_color}\t#{@claude_persona}"],
                 capture_output=True, timeout=0.5,
             )
@@ -1152,32 +1222,43 @@ class TmuxWriter:
                     parts = line.split("\t")
                     if len(parts) >= 2 and parts[0] != pane_id and parts[1]:
                         # Sibling has claude state — promote to window level
-                        cls._run(["tmux", "set", "-w", "-t", pane_id, "@claude_window_state", parts[1]])
+                        cls._run([*TMUX_CMD, "set", "-w", "-t", pane_id, "@claude_window_state", parts[1]])
                         if len(parts) >= 3 and parts[2]:
-                            cls._run(["tmux", "set", "-w", "-t", pane_id, "@claude_window_color", parts[2]])
+                            cls._run([*TMUX_CMD, "set", "-w", "-t", pane_id, "@claude_window_color", parts[2]])
                         if len(parts) >= 4 and parts[3]:
-                            cls._run(["tmux", "set", "-w", "-t", pane_id, "@claude_window_persona", parts[3]])
+                            cls._run([*TMUX_CMD, "set", "-w", "-t", pane_id, "@claude_window_persona", parts[3]])
                         sibling_found = True
                         break
             if not sibling_found:
-                for opt in ("@claude_window_state", "@claude_window_color", "@claude_window_persona", "@claude_window_hook", "@claude_window_voice", "@claude_window_focus"):
-                    cls._run(["tmux", "set", "-wu", "-t", pane_id, opt])
+                for opt in ("@claude_window_state", "@claude_window_color", "@claude_window_persona", "@claude_window_hook", "@claude_window_voice", "@claude_window_focus", "@claude_window_agents"):
+                    cls._run([*TMUX_CMD, "set", "-wu", "-t", pane_id, opt])
         except Exception:
             # Fallback: just clear window options
-            for opt in ("@claude_window_state", "@claude_window_color", "@claude_window_persona", "@claude_window_hook", "@claude_window_voice", "@claude_window_focus"):
-                cls._run(["tmux", "set", "-wu", "-t", pane_id, opt])
+            for opt in ("@claude_window_state", "@claude_window_color", "@claude_window_persona", "@claude_window_hook", "@claude_window_voice", "@claude_window_focus", "@claude_window_agents"):
+                cls._run([*TMUX_CMD, "set", "-wu", "-t", pane_id, opt])
 
     @staticmethod
     def pane_exists(pane_id: str) -> bool:
-        """Check if a tmux pane ID is currently valid."""
+        """Check if a tmux pane ID is currently valid.
+
+        Raises TmuxUnreachable if the server could not be contacted at all.
+        "tmux said no such pane" and "I could not ask tmux" are different
+        answers; collapsing them into False let a connection failure read as
+        "every pane died" and silently wipe the entire pane table.
+        """
         try:
             result = subprocess.run(
-                ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_id}"],
+                [*TMUX_CMD, "display-message", "-p", "-t", pane_id, "#{pane_id}"],
                 capture_output=True, timeout=0.3,
             )
-            return result.returncode == 0 and bool(result.stdout.strip())
-        except Exception:
-            return False
+        except Exception as e:
+            raise TmuxUnreachable(f"{type(e).__name__}: {e}") from e
+        if result.returncode == 0:
+            return bool(result.stdout.strip())
+        err = result.stderr.decode("utf-8", "replace").strip()
+        if "error connecting" in err or "no server running" in err:
+            raise TmuxUnreachable(err)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1215,14 +1296,14 @@ class StreamManager:
         try:
             # Detach any existing pipe (old handler gets EOF and exits cleanly)
             subprocess.run(
-                ["tmux", "pipe-pane", "-t", pane_id],
+                [*TMUX_CMD, "pipe-pane", "-t", pane_id],
                 capture_output=True, timeout=0.5,
             )
             # -O = output only. python3 -u = unbuffered (critical for timely segments).
             # Shell-quote paths to prevent injection.
             cmd = f"python3 -u {shlex.quote(str(STREAM_HANDLER))} {shlex.quote(pane_id)}"
             result = subprocess.run(
-                ["tmux", "pipe-pane", "-O", "-t", pane_id, cmd],
+                [*TMUX_CMD, "pipe-pane", "-O", "-t", pane_id, cmd],
                 capture_output=True, timeout=1.0,
             )
             if result.returncode == 0:
@@ -1245,7 +1326,7 @@ class StreamManager:
             return
         try:
             result = subprocess.run(
-                ["tmux", "capture-pane", "-p", "-S", "-", "-J", "-t", pane_id],
+                [*TMUX_CMD, "capture-pane", "-p", "-S", "-", "-J", "-t", pane_id],
                 capture_output=True, timeout=2.0,
             )
             if result.returncode == 0:
@@ -1284,7 +1365,7 @@ class StreamManager:
         count = 0
         try:
             result = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+                [*TMUX_CMD, "list-panes", "-a", "-F", "#{pane_id}"],
                 capture_output=True, timeout=2.0,
             )
             if result.returncode == 0:
@@ -1394,7 +1475,7 @@ class TmuxArbiter:
                             # Color mismatch on idle pane — normalize to canonical idle color.
                             pane = replace(pane, color=idle_color, glyph=idle_glyph)
                             corrected += 1
-                        elif pane.state_name in ("working", "agents") and age_mins > STALE_WORKING_MINS:
+                        elif pane.provider != "codex" and pane.state_name in ("working", "agents") and age_mins > STALE_WORKING_MINS:
                             # Stale active state — clear to idle (Stop/SubagentStop never fired).
                             state_name, color, glyph = self.theme.resolve_event("Stop")
                             pane = replace(pane, state_name=state_name, color=color, glyph=glyph,
@@ -1425,6 +1506,10 @@ class TmuxArbiter:
                 _log(f"state loaded: {restored} restored, {skipped} skipped (dead panes){extra}")
                 if corrected:
                     self._persist()  # write corrected colors back to state file
+            except TmuxUnreachable as e:
+                _log(f"state load ABORTED — tmux unreachable on socket "
+                     f"{TMUX_SOCKET or '(default)'}: {e}. State file kept intact; "
+                     f"not starting fresh.")
             except Exception as e:
                 _log(f"state load failed: {e} — starting fresh")
 
@@ -1433,7 +1518,7 @@ class TmuxArbiter:
         # that we don't yet track. Adopt them with their current tmux options.
         try:
             result = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{@claude_state}"],
+                [*TMUX_CMD, "list-panes", "-a", "-F", "#{pane_id} #{@claude_state}"],
                 capture_output=True, timeout=2.0,
             )
             if result.returncode == 0:
@@ -1450,7 +1535,7 @@ class TmuxArbiter:
                     # Note: @claude_color is intentionally NOT read — we always use the
                     # canonical idle color (stale hook.sh writes are discarded).
                     persona_r = subprocess.run(
-                        ["tmux", "show-options", "-pv", "-t", pid, "@claude_persona"],
+                        [*TMUX_CMD, "show-options", "-pv", "-t", pid, "@claude_persona"],
                         capture_output=True, timeout=0.3,
                     )
                     # Use @claude_persona if set; otherwise detect from --agent process flag.
@@ -1492,6 +1577,9 @@ class TmuxArbiter:
         """
         if not pane_id or pane_id == "_global":
             return
+
+        prev = self.panes.get(pane_id)
+        provider = data.get("_provider") or (prev.provider if prev else "claude")
 
         # Guard 0: PaneRead — synthetic event from tmux-window-state.sh.
         # Transitions unread → idle. Not a Claude Code hook event.
@@ -1540,7 +1628,6 @@ class TmuxArbiter:
             return
 
         # Persona resolution — sticky: preserve existing persona unless new agent_type
-        prev = self.panes.get(pane_id)
         existing_persona = prev.persona if prev else ""
         new_persona = existing_persona  # default: keep what's there
 
@@ -1576,6 +1663,16 @@ class TmuxArbiter:
             new_depth = max(0, prev_depth - 1)
         elif event in ("SessionStart", "SessionEnd"):
             new_depth = 0  # session boundary resets depth
+        if provider == "codex" and "_active_agent_count" in data:
+            # The Codex adapter de-duplicates by stable agent_id, so its set
+            # cardinality is authoritative even when stops arrive out of order.
+            new_depth = max(0, int(data.get("_active_agent_count", 0)))
+
+        # Codex delegation is not a mutually-exclusive state: the parent can
+        # continue reasoning or using tools while children run. Keep the base
+        # state working and expose delegation through @claude_agents.
+        if provider == "codex" and event in ("SubagentStart", "SubagentStop"):
+            state_name, color, glyph = self.theme.resolve_event("UserPromptSubmit")
 
         # Guard 5: Subagent active → preserve agents state.
         # When subagent_depth > 0, the parent has dispatched agents that haven't
@@ -1587,11 +1684,11 @@ class TmuxArbiter:
         #
         # 5b: Stop/TeammateIdle/TaskCompleted → idle: A sub-turn ended but the
         #     agent tree is still active. Return to agents, not idle.
-        if new_depth > 0 and state_name == "working" and event in ("PreToolUse", "UserPromptSubmit"):
+        if provider != "codex" and new_depth > 0 and state_name == "working" and event in ("PreToolUse", "UserPromptSubmit"):
             state_name, color, glyph = self.theme.resolve_event("SubagentStart")
             # Don't log — this fires very frequently
 
-        if state_name == "idle" and event in ("Stop", "TeammateIdle", "TaskCompleted", "PostCompact") and new_depth > 0:
+        if provider != "codex" and state_name == "idle" and event in ("Stop", "TeammateIdle", "TaskCompleted", "PostCompact") and new_depth > 0:
             state_name, color, glyph = self.theme.resolve_event("SubagentStart")
             _log(f"subagent guard: {pane_id} Stop→idle overridden to agents (depth={new_depth})")
 
@@ -1649,7 +1746,7 @@ class TmuxArbiter:
             # Query and cache window name
             try:
                 result = subprocess.run(
-                    ["tmux", "display-message", "-t", pane_id, "-p", "#{window_name}"],
+                    [*TMUX_CMD, "display-message", "-t", pane_id, "-p", "#{window_name}"],
                     capture_output=True, text=True, timeout=0.2,
                 )
                 cached_window = result.stdout.strip()
@@ -1675,7 +1772,7 @@ class TmuxArbiter:
             if not cached_window:
                 try:
                     result = subprocess.run(
-                        ["tmux", "display-message", "-t", pane_id, "-p", "#{window_name}"],
+                        [*TMUX_CMD, "display-message", "-t", pane_id, "-p", "#{window_name}"],
                         capture_output=True, text=True, timeout=0.2,
                     )
                     cached_window = result.stdout.strip()
@@ -1763,6 +1860,8 @@ class TmuxArbiter:
             focus_plugin=focus_plugin,
             window_name=cached_window,
             focus_signals=[asdict(s) for s in self.focus._signals.get(pane_id, {}).values()],
+            provider=provider,
+            active_agent_count=new_depth if provider == "codex" else 0,
         )
 
         _log(f"transition: {pane_id} {prev_name} → {state_name} [{event}] depth={new_depth}")
@@ -1838,8 +1937,16 @@ class TmuxArbiter:
             pane = self.panes[pane_id]
             pane_changed = False
 
-            # Remove panes that no longer exist in tmux (crashed, closed)
-            if not TmuxWriter.pane_exists(pane_id):
+            # Remove panes that no longer exist in tmux (crashed, closed).
+            # If tmux itself is unreachable we know nothing about any pane —
+            # abandon the whole pass rather than declaring them all dead.
+            try:
+                alive = TmuxWriter.pane_exists(pane_id)
+            except TmuxUnreachable as e:
+                _log(f"reconcile: ABORTED — tmux unreachable on socket "
+                     f"{TMUX_SOCKET or '(default)'}: {e}. State left untouched.")
+                return corrections
+            if not alive:
                 _log(f"reconcile: removing dead pane {pane_id}")
                 del self.panes[pane_id]
                 self.stream.detach(pane_id)
@@ -1854,7 +1961,7 @@ class TmuxArbiter:
             event_age = now - pane.updated_at
             hookless = event_age > self.config.hookless_threshold
             stale_timeout = self.config.stale_working_mins
-            should_check_stale = (
+            should_check_stale = pane.provider != "codex" and (
                 (pane.state_name == "agents")  # always check — no CPU fallback
                 or (pane.state_name == "working" and not hookless)  # working: only hooked panes
             )
@@ -1899,7 +2006,7 @@ class TmuxArbiter:
 
             if hookless and pane.last_source == "hook" and event_age < self.config.hook_priority_secs:
                 pass  # Hook set this state recently — trust it, don't override
-            elif hookless and pane.state_name not in ("agents",):
+            elif hookless and pane.provider != "codex" and pane.state_name not in ("agents",):
                 cpu_active = detect_pane_cpu_active(pane_id)
                 tool_running = detect_tool_execution(pane_id)
 
@@ -1971,7 +2078,7 @@ class TmuxArbiter:
         # bugs, etc.) and auto-registers them with correct persona.
         try:
             r = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_command}"],
+                [*TMUX_CMD, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_command}"],
                 capture_output=True, timeout=1.0,
             )
             if r.returncode == 0:
@@ -2011,7 +2118,7 @@ class TmuxArbiter:
         try:
             all_tmux_panes: set[str] = set()
             r = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+                [*TMUX_CMD, "list-panes", "-a", "-F", "#{pane_id}"],
                 capture_output=True, timeout=1.0,
             )
             if r.returncode == 0:
@@ -2041,6 +2148,8 @@ class TmuxArbiter:
                     "age_seconds": round(now - ps.updated_at, 1),
                     "startup_guard_active": self._in_startup_window(pid),
                     "subagent_depth": ps.subagent_depth,
+                    "provider": ps.provider,
+                    "active_agent_count": ps.active_agent_count,
                     "last_source": ps.last_source,
                     "event_history": (ps.event_history or [])[-5:],
                 }
@@ -2082,6 +2191,10 @@ class ArbiterServer:
         _log(
             f"tmux-arbiter ready (pid={os.getpid()}, "
             f"panes={len(self.arbiter.panes)}, socket={ARBITER_SOCKET})"
+        )
+        _log(
+            f"tmux server: -L {TMUX_SOCKET or '(bare/default)'} "
+            f"[{TMUX_SOCKET_REASON}] — cmd={' '.join(TMUX_CMD)}"
         )
 
         _setup_signals(self)

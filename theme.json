@@ -76,6 +76,10 @@
       "emoji": "✨",
       "label": "Claude"
     },
+    "codex": {
+      "emoji": "⌘",
+      "label": "Codex"
+    },
     "alice": {
       "emoji": "🌱",
       "label": "Example persona"
@@ -88,6 +92,7 @@
   "segment_order": [
     "persona",
     "voice",
+    "agents",
     "focus",
     "hook"
   ],
