@@ -1140,13 +1140,16 @@ class ThemeLoader:
 # ---------------------------------------------------------------------------
 
 class TmuxWriter:
-    """Thin wrapper around tmux set -p calls. Failures are logged, never raised."""
+    """Project indicator changes in one batch. Failures are logged, never raised."""
 
     @staticmethod
     def _run(cmd: list[str]) -> bool:
         """Run a tmux command. Returns True on success."""
         try:
             result = subprocess.run(cmd, capture_output=True, timeout=0.3)
+            if result.returncode != 0:
+                _log(f"tmux cmd failed: {' '.join(cmd[:5])!r}: "
+                     f"{result.stderr.decode(errors='replace').strip()}")
             return result.returncode == 0
         except Exception as e:
             _log(f"tmux cmd failed: {' '.join(cmd[:5])!r}: {e}")
@@ -1154,50 +1157,74 @@ class TmuxWriter:
 
     @classmethod
     def write_state(cls, pane: PaneState) -> None:
-        """Write all indicator options for a pane to tmux.
+        """Read tmux's current options, then batch only changed indicators.
 
         Also updates window-level fallback options for split-pane support.
         NEVER touches @claude_voice — that option belongs to voice_arbiter.py.
-        NEVER clears @claude_persona if pane.persona is "" — preserves existing.
+        Empty hook emoji preserves the last event. Empty pane persona clears it.
         """
         t = pane.pane_id
-        cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_state", pane.glyph])
-        cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_color", pane.color])
+        marker = "__claude_window_options__"
+        try:
+            result = subprocess.run(
+                [*TMUX_CMD, "show-options", "-p", "-t", t, ";",
+                 "display-message", "-p", "-t", t, marker, ";",
+                 "show-options", "-w", "-t", t],
+                capture_output=True, text=True, timeout=0.3,
+            )
+            if result.returncode != 0:
+                _log(f"tmux option read failed for {t}: {result.stderr.strip()}")
+                return
+            pane_text, separator, window_text = result.stdout.partition(marker + "\n")
+            if not separator:
+                _log(f"tmux option read incomplete for {t}")
+                return
+            current = {}
+            for scope, text in (("p", pane_text), ("w", window_text)):
+                for line in text.splitlines():
+                    if line.startswith("@"):
+                        name, value = shlex.split(line)
+                        current[scope, name] = value
+        except Exception as e:
+            _log(f"tmux option read failed for {t}: {e}")
+            return
+
+        agents = ("◉" if pane.active_agent_count == 1 else f"◉{pane.active_agent_count}") \
+            if pane.active_agent_count > 0 else None
+        desired = [
+            ("p", "@claude_state", pane.glyph),
+            ("p", "@claude_color", pane.color),
+            ("p", "@claude_persona", pane.persona or None),
+            ("w", "@claude_window_state", pane.glyph),
+            ("w", "@claude_window_color", pane.color),
+            ("p", "@claude_focus", pane.focus_emoji or None),
+            ("w", "@claude_window_focus", pane.focus_emoji or None),
+            ("p", "@claude_agents", agents),
+            ("w", "@claude_window_agents", agents),
+        ]
         if pane.persona:
-            cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_persona", pane.persona])
-        else:
-            # Explicitly clear if persona is empty — removes stale/incorrect emoji
-            cls._run([*TMUX_CMD, "set", "-pu", "-t", t, "@claude_persona"])
-        # Update window-level fallback for split-pane indicator preservation.
-        # This ensures the window tab shows the latest state even if a non-Claude
-        # pane is focused. The after-select-pane hook also updates these, but the
-        # arbiter keeps them fresh on every state change for immediate feedback.
-        cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_state", pane.glyph])
-        cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_color", pane.color])
-        if pane.persona:
-            cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_persona", pane.persona])
-        # Hook emoji — shows last event + optional tool refinement.
-        # Only write when non-empty; never clear (preserves last-known emoji).
-        # Cleared explicitly on SessionEnd via clear_state().
+            desired.append(("w", "@claude_window_persona", pane.persona))
         if pane.hook_emoji:
-            cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_hook", pane.hook_emoji])
-            cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_hook", pane.hook_emoji])
-        # Focus emoji — venture/plugin indicator from cwd.
-        if pane.focus_emoji:
-            cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_focus", pane.focus_emoji])
-            cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_focus", pane.focus_emoji])
-        else:
-            cls._run([*TMUX_CMD, "set", "-pu", "-t", t, "@claude_focus"])
-            cls._run([*TMUX_CMD, "set", "-wu", "-t", t, "@claude_window_focus"])
-        # Codex delegation is orthogonal to the parent's operational state.
-        # Render it as a separate segment rather than replacing working/asking.
-        if pane.active_agent_count > 0:
-            glyph = "◉" if pane.active_agent_count == 1 else f"◉{pane.active_agent_count}"
-            cls._run([*TMUX_CMD, "set", "-p", "-t", t, "@claude_agents", glyph])
-            cls._run([*TMUX_CMD, "set", "-w", "-t", t, "@claude_window_agents", glyph])
-        else:
-            cls._run([*TMUX_CMD, "set", "-pu", "-t", t, "@claude_agents"])
-            cls._run([*TMUX_CMD, "set", "-wu", "-t", t, "@claude_window_agents"])
+            desired.extend([
+                ("p", "@claude_hook", pane.hook_emoji),
+                ("w", "@claude_window_hook", pane.hook_emoji),
+            ])
+
+        # Each set-option requests a full client redraw, even for unchanged
+        # values. One command queue avoids intermediate indicator frames.
+        # Read actual options every time so external drift and failed writes
+        # are repaired on the next event rather than hidden by an intent cache.
+        cmd = list(TMUX_CMD)
+        for scope, name, value in desired:
+            if current.get((scope, name)) == value:
+                continue
+            if len(cmd) > len(TMUX_CMD):
+                cmd.append(";")
+            cmd.extend(["set", f"-{scope}" + ("u" if value is None else ""), "-t", t, name])
+            if value is not None:
+                cmd.append(value)
+        if len(cmd) > len(TMUX_CMD):
+            cls._run(cmd)
 
     @classmethod
     def clear_state(cls, pane_id: str) -> None:
