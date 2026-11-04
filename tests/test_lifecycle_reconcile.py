@@ -1,5 +1,7 @@
 """Native turn state must survive quiet inference and fail visibly on evidence loss."""
 import importlib.util
+import asyncio
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +18,7 @@ def arbiter(monkeypatch, tmp_path):
     mod = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, mod)
     spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "ARBITER_LOG", tmp_path / "arbiter.log")
     arb = object.__new__(mod.TmuxArbiter)
     arb.config = mod.Config()
     arb.theme = mod.ThemeLoader(path.parent.parent / "theme.json")
@@ -147,6 +150,156 @@ def test_old_native_idle_cannot_override_new_prompt_hook(arbiter):
     for _ in range(3):
         arb.reconcile_lifecycle()
         assert arb.panes["%8"].state_name == "working"
+
+
+def test_native_provider_recovers_from_foreign_hook_corruption(arbiter):
+    _, arb, evidence, _, _ = arbiter
+    evidence["%8"].update(provider="claude", source="claude-session", state="idle")
+    arb.reconcile_lifecycle()
+    pane = arb.panes["%8"]
+    pane.provider = "codex"
+    pane.state_name = "working"
+    pane.last_source = "hook"
+    pane.updated_at = time.time()
+    arb.reconcile_lifecycle()
+    assert arb.panes["%8"].provider == "claude"
+    assert arb.panes["%8"].state_name == "idle"
+
+
+def test_foreign_provider_hook_cannot_claim_native_execution(arbiter):
+    _, arb, evidence, writes, _ = arbiter
+    evidence["%8"].update(provider="claude", source="claude-session", state="idle")
+    arb.reconcile_lifecycle()
+    before = len(writes)
+    arb.apply_event("PreToolUse", "%8", {"_provider": "codex", "session_id": "thread"})
+    assert arb.panes["%8"].provider == "claude"
+    assert arb.panes["%8"].state_name == "idle"
+    assert len(writes) == before
+
+
+def test_native_idle_reclaims_state_after_hook_grace_expires(arbiter):
+    _, arb, evidence, _, _ = arbiter
+    evidence["%8"]["state"] = "idle"
+    arb.reconcile_lifecycle()
+    arb.apply_event("UserPromptSubmit", "%8", {"_provider": "codex"})
+    arb.panes["%8"].updated_at -= arb.config.hook_priority_secs + 1
+    arb.reconcile_lifecycle()
+    assert arb.panes["%8"].state_name == "unread"
+
+
+def test_quiet_native_work_does_not_expire_with_hook_grace(arbiter):
+    _, arb, _, _, _ = arbiter
+    arb.reconcile_lifecycle()
+    arb.apply_event("UserPromptSubmit", "%8", {"_provider": "codex"})
+    arb.panes["%8"].updated_at -= arb.config.hook_priority_secs + 1
+    arb.reconcile_lifecycle()
+    assert arb.panes["%8"].state_name == "working"
+
+
+def test_socket_rejects_foreign_hook_before_state_mutation(arbiter):
+    mod, arb, evidence, writes, _ = arbiter
+    evidence["%8"].update(provider="claude", state="idle", source="claude-session")
+    arb.reconcile_lifecycle()
+    arb.rejected_events = {}
+    server = object.__new__(mod.ArbiterServer)
+    server.arbiter = arb
+    response = asyncio.run(server._dispatch({"type": "event", "event": "PreToolUse",
+        "pane": "%8", "data": {"_provider": "codex", "session_id": "thread"}}))
+    assert response == {"type": "event_rejected", "reason": "provider-mismatch"}
+    assert arb.rejected_events == {"provider-mismatch": 1}
+    assert arb.panes["%8"].state_name == "idle"
+    assert len(writes) == 1
+
+
+def test_restart_skips_bad_row_and_revalidates_cached_native_state(arbiter, monkeypatch, tmp_path):
+    mod, arb, evidence, writes, _ = arbiter
+    arb.reconcile_lifecycle()
+    cached = mod.asdict(arb.panes["%8"])
+    cached.update(lifecycle_identity="previous-process", persona="saved")
+    path = tmp_path / "states.json"
+    path.write_text(json.dumps({"%0": {"invalid": True}, "%8": cached}))
+    monkeypatch.setattr(mod, "STATE_PATH", path)
+    monkeypatch.setattr(mod.TmuxWriter, "pane_exists", lambda pane: True)
+    monkeypatch.setattr(mod.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=b""))
+    arb.panes.clear()
+    writes.clear()
+    arb._load()
+    assert list(arb.panes) == ["%8"]
+    assert writes == [], "cached active badges must not be projected before validation"
+    monkeypatch.setattr(mod.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout="%8\t100\tcodex\n"))
+    evidence["%8"]["state"] = "idle"
+    arb.reconcile_lifecycle()
+    assert writes[-1].state_name == "idle"
+    assert writes[-1].lifecycle_identity != "previous-process"
+
+
+def test_legacy_active_cache_cannot_label_reused_shell(arbiter, monkeypatch, tmp_path):
+    mod, arb, evidence, writes, clears = arbiter
+    arb.reconcile_lifecycle()
+    cached = mod.asdict(arb.panes["%8"])
+    cached.update(lifecycle_source="", lifecycle_identity="", persona="saved")
+    path = tmp_path / "legacy-states.json"
+    path.write_text(json.dumps({"%8": cached}))
+    monkeypatch.setattr(mod, "STATE_PATH", path)
+    monkeypatch.setattr(mod.TmuxWriter, "pane_exists", lambda pane: True)
+    monkeypatch.setattr(mod.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=b""))
+    arb.panes.clear()
+    writes.clear()
+    arb._load()
+    assert writes == []
+    assert arb.panes["%8"].state_name == "unknown"
+    evidence.clear()
+    monkeypatch.setattr(mod.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout="%8\t100\tfish\n"))
+    arb.reconcile_lifecycle()
+    assert "%8" not in arb.panes
+    assert clears == ["%8"]
+
+
+@pytest.mark.parametrize("current_process", [True, False])
+def test_dispatch_requires_live_process_for_matching_session(arbiter, monkeypatch, current_process):
+    mod, arb, evidence, writes, _ = arbiter
+    evidence["%8"]["state"] = "idle"
+    arb.reconcile_lifecycle()
+    arb.rejected_events = {}
+    monkeypatch.setattr(mod.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout="100\t/private/server.sock\n"))
+    monkeypatch.setattr(mod, "process_is_current", lambda binding, shell: current_process)
+    server = object.__new__(mod.ArbiterServer)
+    server.arbiter = arb
+    response = asyncio.run(server._dispatch({"type": "event", "event": "UserPromptSubmit",
+        "pane": "%8", "data": {"_provider": "codex", "session_id": "thread"},
+        "source": {"provider": "codex", "session_id": "thread",
+                   "socket_path": "/private/server.sock", "sent_at": time.time()}}))
+    if current_process:
+        assert response is None
+        assert arb.panes["%8"].state_name == "working"
+        assert len(writes) == 2
+    else:
+        assert response == {"type": "event_rejected", "reason": "execution-mismatch"}
+        assert arb.panes["%8"].state_name == "idle"
+        assert len(writes) == 1
+
+
+def test_foreign_window_refresh_cannot_mark_read_or_project(arbiter, monkeypatch):
+    mod, arb, _, writes, _ = arbiter
+    arb.reconcile_lifecycle()
+    arb.panes["%8"].state_name = "unread"
+    monkeypatch.setattr(mod.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout="/private/main.sock\n"))
+    refreshed = []
+    monkeypatch.setattr(mod.TmuxWriter, "refresh_window", lambda pane: refreshed.append(pane))
+    server = object.__new__(mod.ArbiterServer)
+    server.arbiter = arb
+    response = asyncio.run(server._dispatch({"type": "window_refresh", "pane": "%8",
+        "mark_read": True, "socket_path": "/private/other.sock"}))
+    assert response == {"type": "error", "message": "tmux server mismatch"}
+    assert arb.panes["%8"].state_name == "unread"
+    assert refreshed == []
+    assert len(writes) == 1
 
 
 def test_new_execution_cannot_inherit_old_prompt_hook(arbiter):

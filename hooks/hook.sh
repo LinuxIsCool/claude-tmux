@@ -2,28 +2,37 @@
 # claude-tmux hook — forwards events to tmux-arbiter daemon.
 # Falls back to direct tmux write if daemon is not running.
 #
-# Fast path (daemon running):   ~5ms — socat write, fire-and-forget
-# Fallback path (no daemon):    ~50ms — bash state resolution via common.sh
+# Sends bounded lifecycle metadata. Tool bodies never enter the transport.
+# The socat write is fire-and-forget; all paths remain nonfatal.
 #
 # Never returns nonzero — Claude Code treats hook failure as fatal.
 
 EVENT="${1:-}"
-STDIN_JSON=$(timeout 2 cat 2>/dev/null || echo '{}')
 SOCK="${HOME}/.claude/local/tmux/arbiter.sock"
 
-# Self-heal: if TMUX_PANE is not in env, resolve from tmux.
-# Claude Code does not always pass TMUX_PANE to hook subprocesses (observed on --resume).
-if [ -z "${TMUX_PANE:-}" ] && [ -n "${TMUX:-}" ]; then
-    TMUX_PANE=$(tmux display-message -p '#{pane_id}' 2>/dev/null)
+# Parse once with bounded input/output, preserving exact server/session identity.
+# Missing/invalid bindings are a no-op. Never infer a pane from current focus.
+# A malformed or oversized input is a no-op rather than malformed NDJSON.
+PLUGIN_DIR="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
+PAYLOAD=$(timeout 2 python3 "${PLUGIN_DIR}/scripts/hook-payload.py" \
+    "$EVENT" "${TMUX_PANE:-}" "${TMUX:-}" 2>/dev/null) || PAYLOAD=""
+if [ -z "$PAYLOAD" ]; then
+    echo '{}'
+    exit 0
+fi
+
+# Only session persistence and the fallback need individual data fields.
+STDIN_JSON='{}'
+if [ "$EVENT" = "SessionStart" ] || [ ! -S "$SOCK" ]; then
+    STDIN_JSON=$(printf '%s' "$PAYLOAD" | jq -c '.data' 2>/dev/null) || STDIN_JSON='{}'
 fi
 
 # --- Fast path: forward to daemon (fire-and-forget) ---
 # socat -t 0.1: 100ms connect timeout — if daemon not up, fails fast
 # &: background the socat write so hook returns immediately
 if [ -S "$SOCK" ]; then
-    printf '%s\n' \
-        "{\"type\":\"event\",\"event\":\"${EVENT}\",\"pane\":\"${TMUX_PANE:-}\",\"data\":${STDIN_JSON}}" \
-        | socat -t 0.1 - "UNIX-CONNECT:${SOCK}" 2>/dev/null &
+    printf '%s\n' "$PAYLOAD" \
+        | socat -t 0.1 - "UNIX-CONNECT:${SOCK}" >/dev/null 2>&1 &
 
     # Session ID persistence still runs in fallback AND daemon path.
     # The arbiter does not write resurrect state files — that's hook.sh's job.
@@ -32,12 +41,11 @@ if [ -S "$SOCK" ]; then
         if [ "$SOURCE" != "compact" ]; then
             SESSION_ID=$(printf '%s' "$STDIN_JSON" | jq -r '.session_id // empty' 2>/dev/null)
             if [ -n "$SESSION_ID" ]; then
-                PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
                 source "${PLUGIN_DIR}/lib/common.sh" 2>/dev/null
                 save_session_state "$TMUX_PANE" "$SESSION_ID"
             fi
             # Update session icons in background
-            bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/claude-tmux-session-icons.sh" 2>/dev/null &
+            bash "${PLUGIN_DIR}/scripts/claude-tmux-session-icons.sh" 2>/dev/null &
         fi
     fi
 
@@ -47,7 +55,7 @@ fi
 
 # --- Fallback path: direct tmux write ---
 # Used when daemon is not running. Preserves all behavior from before the refactor.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
+source "${PLUGIN_DIR}/lib/common.sh"
 
 # Debug logging (opt-in via @claude_tmux_debug pane option)
 if [ -n "${TMUX_PANE:-}" ] && [ "$(tmux show-option -pqv -t "${TMUX_PANE}" @claude_tmux_debug 2>/dev/null)" = "on" ]; then
@@ -95,7 +103,7 @@ case "$STATE_NAME" in
         if [ "$EVENT" = "SessionStart" ]; then
             SESSION_ID=$(printf '%s' "$STDIN_JSON" | jq -r '.session_id // empty' 2>/dev/null)
             [ -n "$SESSION_ID" ] && [ -n "${TMUX_PANE:-}" ] && save_session_state "$TMUX_PANE" "$SESSION_ID"
-            bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/claude-tmux-session-icons.sh" 2>/dev/null &
+            bash "${PLUGIN_DIR}/scripts/claude-tmux-session-icons.sh" 2>/dev/null &
         fi
         ;;
 esac

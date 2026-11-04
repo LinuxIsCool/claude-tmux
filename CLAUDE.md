@@ -4,15 +4,19 @@ Activity indicators in tmux window tabs for Claude Code sessions.
 
 ## Architecture
 
-Daemon-owned Moore state machine. Hooks are thin forwarders; the arbiter owns all state.
-Multi-signal fallback handles hookless/resumed sessions. Config hot-reloads via SIGHUP.
+The arbiter owns the lifecycle projection. Native, process-bound metadata
+establishes execution ownership and turn state. Validated hooks cover write
+latency and dialogs. Config hot-reloads via SIGHUP. See
+[status ownership and recovery](README.md#status-ownership-and-recovery) for
+the current invariants and limitations. CPU fallback details below describe
+legacy compatibility paths, not authoritative native lifecycle state.
 
 ```
 Claude Code fires hook
   → hook.sh (15-line socat forwarder)
     → ~/.claude/local/tmux/arbiter.sock
       → tmux-arbiter.py (Python asyncio daemon — owns all state)
-        → ~/.claude/local/tmux/pane-states.json  (source of truth, atomic writes)
+        → ~/.claude/local/tmux/pane-states.json  (derived cache, atomic writes)
           → tmux set -p @claude_state/@claude_color/@claude_persona  (derived view)
             → window-status-format  →  🏗️⬤ 5:claude-tmux
 ```
@@ -20,10 +24,10 @@ Claude Code fires hook
 **Fallback path** (daemon not running): hook.sh falls back to direct tmux writes via
 the original bash state resolution in `lib/common.sh`. ~50ms vs ~5ms for the fast path.
 
-**Signal priority hierarchy:**
-1. Hooks (authoritative) — from Claude Code event system
-2. Process checks (inferential) — CPU sampling + child process age
-3. Never: lower-priority signal overrides higher
+**Signal priority:** native process/session ownership first. Hooks must match
+that independently observed execution. Busy/dialog hooks have a bounded
+60-second grace window. Native working state remains working during silent
+inference, regardless of CPU activity. Unknown evidence remains unknown.
 
 **Multi-signal activity detection:**
 - CPU tick delta: /proc/pid/stat sampling, configurable window (default 100ms)
@@ -117,15 +121,16 @@ Elicitation/ElicitationResult.
 
 ### Key Behaviors
 
-**Startup guard** — Any `working`-state transition within **5 seconds** of `SessionStart`
+**Startup guard** — Any `working`-state transition within **2 seconds** of `SessionStart`
 is suppressed. Claude Code fires `PreToolUse` during its init sequence (loading plugins,
 running hooks) which is indistinguishable from real tool use at hook level. The guard
 eliminates spurious green-on-startup.
 
-**Stale-working reconciliation** — Every 60 seconds, the reconciliation loop scans all
-panes. Any `working` or `agents` state older than **10 minutes** is cleared to `idle`. This
-mitigates stuck-green-on-cancel (Claude Code does not fire `Stop` on Ctrl+C). `unread`
-is never auto-cleared — it persists until the user visits the pane (PaneRead).
+**Native reconciliation** — Native evidence is read every second. Busy/dialog hooks
+can override older native metadata for at most `hook_priority_secs` (60 seconds by
+default). Quiet native working turns stay working. Projection drift is repaired
+every 3 seconds by default. Legacy panes without native evidence retain the
+2-minute fallback timeout. `unread` persists until the user visits the pane.
 
 **Subagent depth tracking** — `PaneState.subagent_depth` counts unmatched SubagentStart/
 SubagentStop pairs. When `Stop` fires while depth > 0 (a subagent is still running),
@@ -147,10 +152,25 @@ still active during compaction; the indicator should stay as-is.
 
 hook.sh sends newline-delimited JSON over the Unix socket:
 ```json
-{"type": "event", "event": "PreToolUse", "pane": "%12", "data": {...}}
+{
+  "type": "event",
+  "event": "PreToolUse",
+  "pane": "%12",
+  "source": {
+    "socket_path": "/path/to/tmux.sock",
+    "provider": "claude",
+    "session_id": "session-id",
+    "sent_at": 1790000000
+  },
+  "data": {"_provider": "claude", "session_id": "session-id"}
+}
 ```
 
-Arbiter responds with `{}` (fire-and-forget; hook doesn't wait for response).
+Accepted events are fire-and-forget. Rejections carry a diagnostic reason and
+increment status counters. The producer discards transport responses and
+returns exactly `{}` to Claude. Payloads contain bounded lifecycle metadata,
+not full tool inputs or responses. Legacy Codex messages require a unique live
+native provider/session binding, and a turn ID must match when supplied.
 
 ### Check / Stop
 
@@ -455,10 +475,10 @@ bun test                                                           # web topolog
 bash tests/test_tombstone_gc.sh && bash tests/test_claude_restore.sh
 ```
 
-Four suites, 271 tests: arbiter state machine (pytest + a Hypothesis stateful test
-running 500 random event sequences against 8 invariants; host-integration tests
-skip when the optional emoji data is absent), web topology (bun), and sandboxed
-shell suites for tombstone GC and session restore.
+Coverage includes the arbiter state machine and randomized event sequences,
+native collectors, event identity, real private tmux servers, bounded hook
+transport, web topology, and sandboxed shell suites for tombstone GC and
+session restore. Optional host-data tests skip when their data is absent.
 
 ### Manual Testing
 

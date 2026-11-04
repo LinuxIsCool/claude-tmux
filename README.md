@@ -84,6 +84,44 @@ Defaults ship in `config.json` and `theme.json`. Machine-local overrides (never 
 
 Timing, decay half-lives, emoji slots, and the optional shared-vault person attribution are all documented in [CLAUDE.md](CLAUDE.md), which is the full architecture reference: state table, wire protocol, reconciliation behaviors, forensics, and troubleshooting.
 
+## Status ownership and recovery
+
+Native lifecycle metadata establishes which live process and session owns a
+pane. The arbiter combines that evidence with validated hooks, persists a
+derived cache, and projects pane and window options into tmux. The window
+badge summarizes its panes. It does not establish whether an agent is busy.
+
+The failure boundaries are:
+
+| Boundary | Rule |
+| --- | --- |
+| Event routing | A pane number alone is insufficient. Require its native provider/session, live PID start time and pane ancestry. New envelopes also require the exact tmux socket and a current timestamp. |
+| Hook precedence | A busy/dialog hook can cover native write latency for `hook_priority_secs` (60 seconds by default). It cannot keep an unchanged native idle reading green indefinitely. Native working state does not expire during quiet inference. |
+| Recovery | Saved active badges are unvalidated cache entries. Read current native evidence before projecting them. Reject malformed records individually and clear entries whose execution has exited. |
+| Transport | Forward bounded lifecycle metadata rather than tool bodies. Receiver rejections are counted and logged with session/process provenance. A hook always returns one valid response. |
+| Testing | Use private homes, profiles, runtime directories and tmux sockets. The test harness rejects access to production files, services and Unix sockets. |
+| Supervision | Start an installed user service through systemd. Direct daemon startup is reserved for installations without that unit. |
+
+The absolute path of a custom tmux socket is retained and used with `-S`.
+Window-focus messages carry the same socket identity, so another server's
+`%0` cannot mark the production `%0` read.
+
+Remaining limits are explicit. Native readers currently require Linux `/proc`;
+this is not a cross-platform process collector. One arbiter monitors one tmux
+server. Legacy Codex adapters lack the new source envelope and are accepted
+only when provider/session has one native owner and the live process binding
+still matches. They cannot supply sender timestamps for ordering checks.
+Moving those adapters into a maintained source package and retiring legacy
+transport is the next boundary to close. Pi/OMP sessions without their native
+extension remain unknown. Adding a dashboard or database does not fill those
+evidence gaps.
+
+The event stream is not a durable task ledger. Native records reconstruct
+activity after event loss or restart, while saved read/unread state is a
+best-effort UI checkpoint. Future consumers should use a versioned projection
+of these same validated observations rather than infer a second lifecycle
+from CPU use, terminal text or window colors.
+
 ## Development
 
 ```bash

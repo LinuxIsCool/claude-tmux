@@ -44,6 +44,19 @@ def _focus_fixture_data(tmp_path, monkeypatch):
     focus test silently depends on host state (and breaks on any other
     machine, including CI).
     """
+    # Exercise real persistence, but only in this test's disposable store.
+    monkeypatch.setattr(_mod, "STATE_PATH", tmp_path / "pane-states.json")
+    monkeypatch.setattr(_mod, "ARBITER_LOG", tmp_path / "arbiter.log")
+    monkeypatch.setattr(_mod, "ARBITER_SOCKET", tmp_path / "arbiter.sock")
+    monkeypatch.setattr(_mod, "TMUX_CMD", ["tmux", "-S", str(tmp_path / "unused.sock")])
+    emoji_path = tmp_path / "emoji.json"
+    emoji_path.write_text(json.dumps({
+        "action:review": "🔍", "action:plan": "📋", "action:research": "🔬",
+        "action:ops": "🛠", "plugin:claude-voice": "🔊", "plugin:claude-hippo": "🦛",
+        "plugin:claude-tmux": "🖥", "venture:legion": "🏛", "venture:regen-ai": "🌱",
+        "venture:acme-corp": "🏢", "person:darren": "👤",
+    }))
+    monkeypatch.setattr(_mod, "EMOJI_FLAT_PATH", emoji_path)
     ventures = {
         "legion": [f"{HOME}/.claude"],
         "acme-corp": [f"{HOME}/Workspace/acme"],
@@ -135,6 +148,94 @@ def _start_session(arb: TmuxArbiter, pane_id: str = PANE) -> None:
     # Move session_start_at into the past to bypass the startup guard
     pane = arb.panes[pane_id]
     arb.panes[pane_id] = replace(pane, session_start_at=time.time() - 10)
+
+
+class TestOperatorIsolation:
+    """Guards are checked without attempting any real operator IO."""
+
+    @pytest.fixture
+    def isolation(self, pytestconfig):
+        return pytestconfig.pluginmanager.getplugin(str(Path(__file__).with_name("conftest.py")))
+
+    def test_real_persistence_uses_only_disposable_paths(self, tmp_path):
+        arb = _make_arbiter()
+        _start_session(arb)
+        assert _mod.STATE_PATH == tmp_path / "pane-states.json"
+        assert PANE in json.loads(_mod.STATE_PATH.read_text())
+        assert _mod.ARBITER_LOG == tmp_path / "arbiter.log"
+        assert _mod.ARBITER_LOG.is_file()
+
+    def test_operator_file_write_is_rejected(self, isolation):
+        import os
+        target = isolation._REAL_HOME / ".claude/local/tmux/pane-states.json"
+        with pytest.raises(PermissionError, match="operator file"):
+            isolation._guard("open", (str(target), "w", os.O_WRONLY | os.O_TRUNC))
+
+    def test_private_symlink_can_be_removed_without_removing_operator_target(self, tmp_path):
+        target = Path(__file__).resolve()
+        before = target.read_bytes()
+        link = tmp_path / "operator-link"
+        link.symlink_to(target)
+        link.unlink()
+        assert not link.is_symlink()
+        assert target.read_bytes() == before
+
+    def test_relative_directory_fd_operations_use_the_private_directory(self, tmp_path):
+        import os
+        target = Path(__file__).resolve()
+        before = target.read_bytes()
+        directory = tmp_path / "operations"
+        directory.mkdir()
+        (directory / "operator-link").symlink_to(target)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.mkdir("child", dir_fd=directory_fd)
+            descriptor = os.open("created", os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=directory_fd)
+            os.close(descriptor)
+            os.chmod("created", 0o600, dir_fd=directory_fd)
+            os.unlink("created", dir_fd=directory_fd)
+            os.rename("operator-link", "renamed-link", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            os.unlink("renamed-link", dir_fd=directory_fd)
+            os.rmdir("child", dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        assert not list(directory.iterdir())
+        assert target.read_bytes() == before
+
+    def test_directory_entry_guard_still_protects_operator_paths(self, isolation):
+        import os
+        directory_fd = os.open(isolation._REAL_HOME, os.O_RDONLY)
+        try:
+            with pytest.raises(PermissionError, match="operator path"):
+                isolation._guard("os.remove", (".claude/local/tmux/pane-states.json", directory_fd))
+        finally:
+            os.close(directory_fd)
+
+    def test_operator_ipc_is_rejected(self, isolation):
+        target = isolation._REAL_HOME / ".claude/local/tmux/arbiter.sock"
+        with pytest.raises(PermissionError, match="Unix IPC"):
+            isolation._guard("socket.connect", (None, str(target)))
+
+    @pytest.mark.parametrize("argv", [
+        ["tmux", "kill-server"],
+        ["tmux", "-S", "/tmp/tmux-1000/persist", "kill-server"],
+        ["tmux", "-S/tmp/tmux-1000/persist", "kill-server"],
+        ["tmux", "-L/tmp/tmux-1000/persist", "kill-server"],
+    ])
+    def test_operator_tmux_is_rejected_before_spawn(self, isolation, argv):
+        with pytest.raises(PermissionError, match="private socket"):
+            isolation._guard("subprocess.Popen", ("tmux", argv, None, None))
+
+    def test_private_tmux_target_is_allowed(self, isolation, tmp_path):
+        argv = ["tmux", "-S", str(tmp_path / "tmux.sock"), "kill-server"]
+        isolation._guard("subprocess.Popen", ("tmux", argv, None, None))
+        with pytest.raises(PermissionError, match="private socket"):
+            isolation._guard("subprocess.Popen", ("tmux", argv[:3] + ["-S/tmp/tmux-1000/persist", "kill-server"], None, None))
+
+    def test_subprocess_cannot_restore_operator_home(self, isolation):
+        import subprocess
+        with pytest.raises(PermissionError, match="non-private HOME"):
+            subprocess.run([sys.executable, "-c", "pass"], env={"HOME": str(isolation._REAL_HOME)})
 
 
 # ---------------------------------------------------------------------------

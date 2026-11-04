@@ -12,9 +12,29 @@ CURRENT_WSF=$(tmux show-option -gv window-status-format 2>/dev/null)
 # Must run unconditionally — even if format strings are already injected,
 # the arbiter needs to be running for indicators to work.
 if ! systemctl --user is-active --quiet claude-tmux-arbiter.service 2>/dev/null; then
-    ARBITER="$(cd "$(dirname "$0")" && pwd)/tmux-arbiter.py"
-    if [ -f "$ARBITER" ] && command -v uv >/dev/null 2>&1; then
-        uv run "$ARBITER" 2>/dev/null &
+    # Keep an installed unit under systemd ownership, including failed/masked
+    # units. A start failure must not create an unmanaged competing launcher.
+    ARBITER_UNIT_INSTALLED=0
+    ARBITER_LOAD_STATE=$(systemctl --user show --property=LoadState --value claude-tmux-arbiter.service 2>/dev/null) || ARBITER_LOAD_STATE=""
+    case "$ARBITER_LOAD_STATE" in
+        ""|not-found) ;;
+        *) ARBITER_UNIT_INSTALLED=1 ;;
+    esac
+    for unit_dir in "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/systemd/user" \
+        "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/systemd/user" \
+        /etc/systemd/user /run/systemd/user /usr/local/lib/systemd/user /usr/lib/systemd/user; do
+        if [ -e "$unit_dir/claude-tmux-arbiter.service" ] || [ -L "$unit_dir/claude-tmux-arbiter.service" ]; then
+            ARBITER_UNIT_INSTALLED=1
+        fi
+    done
+    if [ "$ARBITER_UNIT_INSTALLED" = "1" ]; then
+        systemctl --user start claude-tmux-arbiter.service >/dev/null 2>&1 || true
+    else
+        ARBITER="$(cd "$(dirname "$0")" && pwd)/tmux-arbiter.py"
+        if [ -f "$ARBITER" ] && command -v uv >/dev/null 2>&1; then
+            uv run "$ARBITER" 2>/dev/null &
+        fi
     fi
 fi
 

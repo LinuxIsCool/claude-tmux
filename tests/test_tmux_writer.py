@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import asyncio
 import importlib.util
 import json
 import os
@@ -87,6 +88,47 @@ def test_repeated_state_does_not_repaint_terminal(tmux_writer):
     for _ in range(5):
         mod.TmuxWriter.write_state(pane)
     assert output() == b"", "unchanged indicators must produce no terminal redraw"
+
+
+def test_two_real_servers_with_same_pane_cannot_cross_route(tmux_writer, tmp_path):
+    mod, cmd, pane, output = tmux_writer
+    foreign = ["tmux", "-S", str(tmp_path / "foreign.sock")]
+    subprocess.run([*foreign, "-f", "/dev/null", "new-session", "-d", "sleep 120"], check=True)
+    try:
+        foreign_pane = subprocess.check_output(
+            [*foreign, "display-message", "-p", "#{pane_id}"], text=True).strip()
+        assert foreign_pane == pane.pane_id, "exercise the colliding pane number"
+        shell = int(subprocess.check_output(
+            [*cmd, "display-message", "-p", "#{pane_pid}"], text=True))
+        raw = Path(f"/proc/{shell}/stat").read_text()
+        start = raw[raw.rindex(")") + 2:].split()[19]
+        arb = object.__new__(mod.TmuxArbiter)
+        arb.config = mod.Config()
+        arb.lifecycle_bindings = {pane.pane_id: {
+            "provider": "claude", "session_id": "owner", "process_id": shell,
+            "process_start": start}}
+        arb.rejected_events = {}
+        accepted = []
+        arb.apply_event = lambda **event: accepted.append(event)
+        server = object.__new__(mod.ArbiterServer)
+        server.arbiter = arb
+        mod.TmuxWriter.write_state(pane)
+        output()
+        event = {"type": "event", "event": "PreToolUse", "pane": foreign_pane,
+                 "data": {"session_id": "owner", "_provider": "claude"},
+                 "source": {"session_id": "owner", "provider": "claude",
+                            "socket_path": foreign[2], "sent_at": time.time()}}
+        assert asyncio.run(server._dispatch(event)) == {
+            "type": "event_rejected", "reason": "server-mismatch"}
+        assert asyncio.run(server._dispatch({"type": "window_refresh", "pane": foreign_pane,
+            "mark_read": True, "socket_path": foreign[2]}))["type"] == "error"
+        assert accepted == []
+        assert output() == b"", "foreign events cannot redraw the monitored server"
+        event["source"]["socket_path"] = cmd[2]
+        assert asyncio.run(server._dispatch(event)) is None
+        assert len(accepted) == 1, "the same event with the actual owner is accepted"
+    finally:
+        subprocess.run([*foreign, "kill-server"], check=True)
 
 
 def test_changes_are_batched_and_external_drift_is_repaired(tmux_writer, monkeypatch):
@@ -360,7 +402,8 @@ def test_focus_script_delegates_to_daemon_and_falls_back_for_old_protocol(
         run_script("tmux-window-state.sh", dict(script_env, HOME=home))
         worker.join(timeout=5)
         assert not worker.is_alive()
-        assert messages == [{"type": "window_refresh", "pane": pane.pane_id, "mark_read": True}]
+        assert messages == [{"type": "window_refresh", "pane": pane.pane_id,
+                             "mark_read": True, "socket_path": cmd[2]}]
     expected = "#123456" if acknowledged else pane.color
     assert option(cmd, "@claude_window_color", pane.pane_id) == expected
 

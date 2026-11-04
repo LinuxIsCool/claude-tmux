@@ -6,16 +6,16 @@
 """tmux-arbiter — Claude Code indicator state machine for Legion's tmux environment.
 
 Owns @claude_state / @claude_color / @claude_persona / @claude_hook pane options.
-Hook scripts forward events via Unix socket; arbiter applies them to a
-persistent state store and writes tmux pane options as a derived view.
+Hooks forward bounded events via Unix socket. Native process/session evidence
+binds those events before the arbiter updates its cache and tmux projection.
 
 Architecture:
     hook.sh (bash, fire-and-forget) → arbiter.sock → TmuxArbiter (Python)
-        → pane-states.json (source of truth)
+        + process-bound native lifecycle → pane-states.json (derived cache)
         → tmux set -p @claude_state / @claude_color / @claude_persona / @claude_hook (view)
 
-Reconciliation loop (60s): clears stale working states (>10min), removes
-dead panes, restores tmux options from state store after restart.
+Native reconciliation runs every second. Projection repair runs at the
+configured interval (3s by default); busy hook precedence lasts at most 60s.
 
 Startup guard: suppresses working-state events within 5s of SessionStart
 to eliminate the green-on-init false positive from PreToolUse during init.
@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import signal
 import subprocess
@@ -47,6 +48,9 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path
 from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from event_identity import MAX_EVENT_BYTES, process_is_current, rejection_reason
 
 # ---------------------------------------------------------------------------
 # Path constants
@@ -98,7 +102,7 @@ def _resolve_tmux_socket() -> tuple[str, str]:
     # Launched inside tmux — inherit that server. $TMUX is "<path>,<pid>,<session>".
     tmux_env = os.environ.get("TMUX", "").strip()
     if tmux_env:
-        return Path(tmux_env.split(",")[0]).name, "$TMUX"
+        return tmux_env.rsplit(",", 2)[0], "$TMUX"
 
     # Daemon case: no ambient tmux. Ask the filesystem which servers exist.
     sock_dir = Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}"
@@ -115,7 +119,9 @@ def _resolve_tmux_socket() -> tuple[str, str]:
 
 
 TMUX_SOCKET, TMUX_SOCKET_REASON = _resolve_tmux_socket()
-TMUX_CMD: list[str] = ["tmux"] + (["-L", TMUX_SOCKET] if TMUX_SOCKET else [])
+TMUX_CMD: list[str] = ["tmux"] + (
+    ["-S" if Path(TMUX_SOCKET).is_absolute() else "-L", TMUX_SOCKET] if TMUX_SOCKET else []
+)
 
 
 class TmuxUnreachable(RuntimeError):
@@ -1488,12 +1494,14 @@ class TmuxArbiter:
         self.panes: dict[str, PaneState] = {}
         self.stream = StreamManager()
         # Read current native lifecycle without restarting existing agents.
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
         from agent_lifecycle import Collector as HarnessCollector, read_processes
         from codex_lifecycle import Collector as CodexCollector
         self.lifecycle_collectors = [HarnessCollector(), CodexCollector()]
         self.lifecycle_process_reader = read_processes
+        self.lifecycle_bindings = {}
+        self.rejected_events = {}
         self._load()
+        self.reconcile_lifecycle()
         # Validate venture configuration on startup
         warnings = self.focus.validate_ventures()
         for w in warnings:
@@ -1515,11 +1523,11 @@ class TmuxArbiter:
             _log(f"persist failed: {e}")
 
     def _load(self) -> None:
-        """Load pane states from disk on startup. Restore tmux for live panes.
+        """Load a UI checkpoint, deferring projection until native validation.
 
         Also absorbs pre-existing Claude panes (those with @claude_state set in tmux)
         that are not in the state file — e.g. sessions started before the arbiter ran.
-        These get idle state + default persona from theme.json, then tmux options restored.
+        Legacy rows start unknown and cannot restore an active badge on their own.
         """
         # Phase 1: restore from state file
         if STATE_PATH.exists():
@@ -1529,24 +1537,30 @@ class TmuxArbiter:
                 skipped = 0
                 corrected = 0
                 for pid, ps_dict in data.items():
-                    if TmuxWriter.pane_exists(pid):
-                        # Filter to known fields — forward/backward compatible
+                    try:
+                        if not re.fullmatch(r"%\d+", pid) or not isinstance(ps_dict, dict):
+                            raise ValueError("invalid pane record")
                         known = {f.name for f in fields(PaneState)}
-                        filtered = {k: v for k, v in ps_dict.items() if k in known}
-                        pane = PaneState(**filtered)
+                        pane = PaneState(**{k: v for k, v in ps_dict.items() if k in known})
+                        if (pane.pane_id != pid or not math.isfinite(pane.updated_at)
+                                or not isinstance(pane.focus_signals, list)
+                                or any(not isinstance(getattr(pane, key), int)
+                                       or getattr(pane, key) < 0 for key in
+                                       ("active_agent_count", "subagent_depth"))
+                                or any(not isinstance(getattr(pane, key), str) for key in
+                                       ("state_name", "color", "glyph", "persona",
+                                        "lifecycle_source", "lifecycle_identity"))):
+                            raise ValueError("invalid pane identity or metadata")
+                    except (TypeError, ValueError):
+                        skipped += 1
+                        _log(f"state load: skipped invalid record {pid!r}")
+                        continue
+                    if TmuxWriter.pane_exists(pid):
                         # Phase 1.5: correct stale/mismatched states at load time.
                         _, idle_color, idle_glyph = self.theme.resolve_event("SessionStart")
-                        now = time.time()
-                        age_mins = (now - pane.updated_at) / 60
                         if pane.state_name == "idle" and pane.color != idle_color:
                             # Color mismatch on idle pane — normalize to canonical idle color.
                             pane = replace(pane, color=idle_color, glyph=idle_glyph)
-                            corrected += 1
-                        elif not pane.lifecycle_source and pane.provider != "codex" and pane.state_name in ("working", "agents") and age_mins > STALE_WORKING_MINS:
-                            # Stale active state — clear to idle (Stop/SubagentStop never fired).
-                            state_name, color, glyph = self.theme.resolve_event("Stop")
-                            pane = replace(pane, state_name=state_name, color=color, glyph=glyph,
-                                           updated_at=now)
                             corrected += 1
                         # If persona is unknown, detect from --agent flag in Claude process.
                         if not pane.persona:
@@ -1557,6 +1571,16 @@ class TmuxArbiter:
                                     pane = replace(pane, persona=emoji)
                                     corrected += 1
                                     _log(f"phase1.5: detected persona {persona_key} ({emoji}) for {pid}")
+                        if pane.state_name in ("working", "agents", "asking"):
+                            state, color, glyph = self.theme.resolve_state("unknown")
+                            pane = replace(pane, state_name=state, color=color, glyph=glyph,
+                                           last_source="reconcile", active_agent_count=0,
+                                           subagent_depth=0)
+                        if not pane.lifecycle_source:
+                            state, color, glyph = self.theme.resolve_state("unknown")
+                            pane = replace(pane, state_name=state, color=color, glyph=glyph,
+                                           lifecycle_source="saved-cache-unvalidated",
+                                           active_agent_count=0, subagent_depth=0)
                         self.panes[pid] = pane
                         # Restore focus signals into FocusEngine
                         for sig_dict in ps_dict.get("focus_signals", []):
@@ -1565,7 +1589,8 @@ class TmuxArbiter:
                                 self.focus._signals.setdefault(pid, {})[sig.key] = sig
                             except (TypeError, KeyError):
                                 pass
-                        TmuxWriter.write_state(pane)
+                        # Cache rows are not projected here. The initial native
+                        # scan validates the execution before restoring badges.
                         restored += 1
                     else:
                         skipped += 1
@@ -1615,7 +1640,7 @@ class TmuxArbiter:
                                 _log(f"absorption: detected persona {persona_key} ({persona}) for {pid}")
                     # Always use the proper idle color — do NOT preserve stale @claude_color
                     # from old hook.sh writes (which may be green/working from a stuck state).
-                    state_name, resolved_color, resolved_glyph = self.theme.resolve_event("SessionStart")
+                    state_name, resolved_color, resolved_glyph = self.theme.resolve_state("unknown")
                     pane = PaneState(
                         pane_id=pid,
                         state_name=state_name,
@@ -1624,9 +1649,9 @@ class TmuxArbiter:
                         persona=persona,
                         updated_at=now,
                         session_start_at=0.0,  # safe: no startup guard on adopted panes
+                        lifecycle_source="saved-cache-unvalidated",
                     )
                     self.panes[pid] = pane
-                    TmuxWriter.write_state(pane)  # always write — corrects stale color/glyph
                     absorbed += 1
                 if absorbed:
                     _log(f"absorbed {absorbed} pre-existing Claude pane(s) not in state file")
@@ -1647,6 +1672,12 @@ class TmuxArbiter:
 
         prev = self.panes.get(pane_id)
         provider = data.get("_provider") or (prev.provider if prev else "claude")
+        if event != "PaneRead" and prev and prev.lifecycle_source:
+            session = data.get("session_id")
+            if (provider != prev.provider or
+                    (session and session != prev.lifecycle_identity.rsplit(":", 1)[-1])):
+                _log(f"drop {event} on {pane_id}: hook does not match native execution")
+                return
 
         # Guard 0: PaneRead — synthetic event from tmux-window-state.sh.
         # Transitions unread → idle. Not a Claude Code hook event.
@@ -1988,6 +2019,39 @@ class TmuxArbiter:
 
     # ---- Reconciliation ---------------------------------------------------
 
+    def validate_hook(self, message: dict) -> str | None:
+        """Bind incoming hooks to native evidence, never to a saved badge."""
+        pane_id = message.get("pane", "")
+        binding = self.lifecycle_bindings.get(pane_id) if isinstance(pane_id, str) else None
+        if binding is None:
+            self.reconcile_lifecycle()
+            binding = self.lifecycle_bindings.get(pane_id) if isinstance(pane_id, str) else None
+        # Check structure and native session/provider before spending any IPC.
+        reason = rejection_reason({k: v for k, v in message.items() if k != "source"},
+                                  binding, "", time.time(), self.config.hook_priority_secs)
+        if reason:
+            return reason
+        try:
+            result = subprocess.run(
+                [*TMUX_CMD, "display-message", "-p", "-t", pane_id,
+                 "#{pane_pid}\t#{socket_path}"],
+                capture_output=True, text=True, timeout=0.3,
+            )
+            shell_pid, socket_path = result.stdout.strip().split("\t")
+            if result.returncode or not process_is_current(binding, int(shell_pid)):
+                return "execution-mismatch"
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return "binding-unavailable"
+        # A legacy adapter has no server envelope. Its session must have one
+        # unambiguous native owner, in addition to the live ancestry check.
+        matches = sum(row.get("provider") == binding["provider"]
+                      and row.get("session_id") == binding["session_id"]
+                      for row in self.lifecycle_bindings.values())
+        if matches != 1:
+            return "ambiguous-session"
+        return rejection_reason(message, binding, socket_path, time.time(),
+                                self.config.hook_priority_secs)
+
     def reconcile_lifecycle(self) -> int:
         """Project native, process-bound state. Quiet inference remains working.
 
@@ -2036,6 +2100,7 @@ class TmuxArbiter:
                 observed[pane_id] = {"provider": command, "state": "unknown",
                     "source": "native-metadata-unavailable", "process_id": metadata["pid"],
                     "process_start": process.start if process else "", "session_id": ""}
+        self.lifecycle_bindings = {} if failed else observed
         now = time.time()
         focused = self._get_focused_pane()
         corrections = 0
@@ -2049,13 +2114,15 @@ class TmuxArbiter:
                 native_state = "unknown"
             identity = ":".join(str(evidence.get(key, "")) for key in
                                 ("process_id", "process_start", "session_id"))
-            same_execution = bool(prev and prev.lifecycle_identity == identity)
+            same_execution = bool(prev and prev.provider == provider
+                                  and prev.lifecycle_identity == identity)
             state = native_state
             hook_override = False
             native_updated = evidence.get("updated_at", evidence.get("observed_at")) or 0
             # A hook can expose a dialog before the transcript persists it.
             if (same_execution and prev.last_source == "hook"
-                    and (prev.state_name in ("working", "agents", "asking")
+                    and ((prev.state_name in ("working", "agents", "asking")
+                          and now - prev.updated_at < self.config.hook_priority_secs)
                          or provider == "claude" and prev.state_name in ("idle", "unread", "error"))
                     and native_updated <= prev.updated_at):
                 state = prev.state_name
@@ -2077,6 +2144,7 @@ class TmuxArbiter:
                 active_agent_count = (max(0, int(evidence.get("active_agent_count", 0)))
                                       if evidence["child_count_known"] else 0)
             if (prev and prev.state_name == state and prev.lifecycle_identity == identity
+                    and prev.provider == provider
                     and prev.lifecycle_source == source and prev.color == color and prev.glyph == glyph
                     and prev.active_agent_count == active_agent_count):
                 continue
@@ -2372,6 +2440,7 @@ class TmuxArbiter:
             "theme_path": str(THEME_PATH),
             "state_path": str(STATE_PATH),
             "socket_path": str(ARBITER_SOCKET),
+            "rejected_events": getattr(self, "rejected_events", {}),
         }
 
 
@@ -2397,7 +2466,7 @@ class ArbiterServer:
         self._running = True
 
         server = await asyncio.start_unix_server(
-            self._handle_client, path=str(ARBITER_SOCKET)
+            self._handle_client, path=str(ARBITER_SOCKET), limit=MAX_EVENT_BYTES
         )
 
         _log(
@@ -2405,7 +2474,7 @@ class ArbiterServer:
             f"panes={len(self.arbiter.panes)}, socket={ARBITER_SOCKET})"
         )
         _log(
-            f"tmux server: -L {TMUX_SOCKET or '(bare/default)'} "
+            f"tmux server: {TMUX_SOCKET or '(bare/default)'} "
             f"[{TMUX_SOCKET_REASON}] — cmd={' '.join(TMUX_CMD)}"
         )
 
@@ -2453,6 +2522,9 @@ class ArbiterServer:
             if not raw:
                 return
             msg = json.loads(raw.decode().strip())
+            if not isinstance(msg, dict):
+                _log("rejected IPC message: expected object")
+                return
             response = await self._dispatch(msg)
             if response is not None:
                 writer.write((json.dumps(response) + "\n").encode())
@@ -2481,6 +2553,19 @@ class ArbiterServer:
         if msg_type == "event":
             # Fire-and-forget from hook.sh
             # Format: {"type":"event","event":"UserPromptSubmit","pane":"%42","data":{...}}
+            reason = self.arbiter.validate_hook(msg)
+            if reason:
+                self.arbiter.rejected_events[reason] = self.arbiter.rejected_events.get(reason, 0) + 1
+                data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+                source = msg.get("source") if isinstance(msg.get("source"), dict) else {}
+                _log(f"drop event={msg.get('event')!r} pane={msg.get('pane')!r} "
+                     f"reason={reason} session={data.get('session_id')!r} "
+                     f"socket={source.get('socket_path')!r}")
+                return {"type": "event_rejected", "reason": reason}
+            binding = self.arbiter.lifecycle_bindings[msg["pane"]]
+            _log(f"bound event={msg['event']} pane={msg['pane']} "
+                 f"provider={binding['provider']} session={binding['session_id']} "
+                 f"process={binding['process_id']}:{binding['process_start']}")
             self.arbiter.apply_event(
                 event=msg.get("event", ""),
                 pane_id=msg.get("pane", ""),
@@ -2493,8 +2578,17 @@ class ArbiterServer:
 
         elif msg_type == "window_refresh":
             pane_id = msg.get("pane", "")
-            if not re.fullmatch(r"%\d+", pane_id):
+            if not isinstance(pane_id, str) or not re.fullmatch(r"%\d+", pane_id):
                 return {"type": "error", "message": "invalid pane"}
+            try:
+                result = subprocess.run(
+                    [*TMUX_CMD, "display-message", "-p", "-t", pane_id, "#{socket_path}"],
+                    capture_output=True, text=True, timeout=0.3,
+                )
+                if result.returncode or msg.get("socket_path") != result.stdout.strip():
+                    return {"type": "error", "message": "tmux server mismatch"}
+            except (OSError, subprocess.TimeoutExpired):
+                return {"type": "error", "message": "tmux binding unavailable"}
             if msg.get("mark_read") is True:
                 self.arbiter.apply_event("PaneRead", pane_id, {})
             TmuxWriter.refresh_window(pane_id)

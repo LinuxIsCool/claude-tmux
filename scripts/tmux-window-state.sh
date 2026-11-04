@@ -18,10 +18,11 @@ arbiter.TMUX_CMD = ["tmux"]
 cmd = ["tmux", "display-message", "-p"]
 if sys.argv[2]:
     cmd += ["-t", sys.argv[2]]
-result = subprocess.run(cmd + ["#{pane_id}"], capture_output=True, text=True)
-pane_id = result.stdout.strip()
-if result.returncode or not pane_id:
+result = subprocess.run(cmd + ["#{pane_id}\t#{socket_path}"], capture_output=True, text=True)
+parts = result.stdout.strip().split("\t")
+if result.returncode or len(parts) != 2:
     sys.exit(0)
+pane_id, socket_path = parts
 
 # Keep live lifecycle projections serialized in the daemon. Older or stopped
 # daemons fall back to the same aggregation code below.
@@ -30,7 +31,7 @@ try:
         sock.settimeout(1.0)
         sock.connect(str(arbiter.ARBITER_SOCKET))
         sock.sendall((json.dumps({"type": "window_refresh", "pane": pane_id,
-                                 "mark_read": True}) + "\n").encode())
+                                 "mark_read": True, "socket_path": socket_path}) + "\n").encode())
         response = bytearray()
         while b"\n" not in response:
             chunk = sock.recv(4096)
