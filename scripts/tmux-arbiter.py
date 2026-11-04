@@ -2412,6 +2412,14 @@ class ArbiterServer:
             if not self._running:
                 break
             self.arbiter.reconcile_lifecycle()
+            # The readable window rows share this poller, so resizing and
+            # state changes cannot leave an active window outside the bar.
+            try:
+                from tmux_status_bar import refresh_status_bar
+                if not refresh_status_bar(TMUX_CMD):
+                    _log("status bar refresh failed; retrying on the next lifecycle poll")
+            except Exception as e:
+                _log(f"status bar refresh failed: {e}")
             if time.monotonic() - last_reconcile < self.arbiter.config.reconcile_interval:
                 continue
             last_reconcile = time.monotonic()

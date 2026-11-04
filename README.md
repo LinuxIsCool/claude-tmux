@@ -1,10 +1,8 @@
 # claude-tmux
 
-Live activity indicators in tmux window tabs for [Claude Code](https://claude.com/claude-code) sessions. Every window shows what its Claude is doing right now: working, idle, waiting on a permission, running subagents, or holding a response you haven't read yet. Sessions survive reboots: tmux-resurrect integration resumes the actual conversation, not just the process.
+Live activity indicators for Claude Code, Codex, Pi and Oh My Pi in tmux. Window rows show their names and readable states, wrapping across rows so the first window stays visible. The header clock reads the current system timezone through a fresh process.
 
-![window tab indicators](assets/indicators.svg)
-
-*Illustration of the tab grammar using the shipped theme's real tokens: green working, blue idle, lavender unread, mauve subagents, yellow permission prompt, red error.*
+Legend: **WORK** running, **INPUT** needs a reply, **IDLE** ready, **UNKNOWN** unverified, **ERROR** failed, **SHELL** no tracked agent.
 
 ## How it works
 
@@ -14,7 +12,7 @@ Claude Code fires hook
     → tmux-arbiter.py (asyncio daemon: owns all state)
       → pane-states.json (source of truth, atomic writes)
         → tmux pane options (@claude_state / @claude_color / @claude_persona)
-          → window-status-format  →  ⬤ 5:my-project
+          → readable status rows  →  5:my-project WORK
 ```
 
 The arbiter owns state and aggregates every pane in a window. A working sibling stays visible when an idle pane is selected. Hooks are thin forwarders; if the daemon is down, hooks fall back to direct tmux writes.
@@ -23,7 +21,7 @@ On Linux, native lifecycle readers also cover existing Claude Code and Codex ses
 
 Eight states are defined in `theme.json`: idle, unread, working, agents, asking, error, nudge and unknown. A finished response in an unfocused window shows lavender until you visit it. The aggregate prioritizes working and delegated work before input requests, errors and idle panes.
 
-Optional segments enrich the tabs when their data sources exist: persona emoji, hook-event emoji (two-slot grammar, e.g. 🔧📖 for "reading a file"), and a focus indicator resolving which project the session is working in. All degrade to nothing when absent.
+Pane metadata also supplies persona, hook-event and focus indicators for pane and voice integrations. The window rows use the lifecycle labels above.
 
 ## Install
 
@@ -76,7 +74,7 @@ cp scripts/pi-lifecycle-extension.ts ~/.omp/agent/extensions/legion-tmux.ts
 
 Ordinary new sessions discover it automatically. For a custom agent directory, install it in that directory's `extensions/` folder. A launch using `--no-extensions` needs an explicit `--extension /path/to/pi-lifecycle-extension.ts`. Existing processes keep their loaded extensions and are never restarted by the arbiter.
 
-The extension writes atomic lifecycle metadata under the configured agent directory. The reader checks process start time, PID namespace and session identity. Pi completion uses `agent_settled`; Oh My Pi uses its settled `agent_end` boundary and continuation flags. Message persistence alone does not establish turn completion, so sessions without native evidence remain unknown. Arbitrary extension-owned dialogs have no generic input-wait event and are not inferred from transcript text.
+The extension writes atomic lifecycle metadata under the configured agent directory. The reader checks process start time, PID namespace and session identity. Pi completion uses `agent_settled`; Oh My Pi uses its settled `agent_end` boundary and continuation flags. Pending native select, confirm, input, editor and custom UI promises publish INPUT until they settle. Message persistence alone does not establish turn completion, so sessions without native evidence remain unknown.
 
 ## Configuration
 
