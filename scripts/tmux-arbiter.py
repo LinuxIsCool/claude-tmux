@@ -1147,7 +1147,7 @@ class TmuxWriter:
 
     # Active work must remain visible even when the selected sibling is idle.
     _PRIORITY = {"working": 70, "agents": 60, "asking": 50, "error": 40,
-                 "unread": 30, "unknown": 20, "nudge": 20, "idle": 10}
+                 "unread": 30, "unknown": 0, "nudge": 20, "idle": 10}
     _FIELDS = ("state_name", "state", "color", "persona", "hook", "focus", "agents")
     _theme = ThemeLoader()
 

@@ -213,7 +213,7 @@ def test_other_working_pane_cannot_hide_running_children(tmux_writer):
 
 @pytest.mark.parametrize("names", [
     ("agents", "working"), ("agents", "asking"), ("asking", "error"),
-    ("error", "unread"), ("unread", "unknown"), ("unknown", "idle"),
+    ("error", "unread"), ("unread", "unknown"), ("idle", "unknown"),
 ])
 def test_window_priority_uses_semantic_state(tmux_writer, names):
     mod, cmd, pane, output = tmux_writer
