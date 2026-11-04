@@ -21,6 +21,8 @@ fi
 # --- Format string injection (idempotent: strips old, injects new) ---
 THEME_FILE="$(cd "$(dirname "$0")/.." && pwd)/theme.json"
 
+# Build the legacy title decorations. Pane options remain available to voice,
+# focus and other consumers, but these decorations are not window-tab content.
 # Build segment fragments from theme.json segment_order array.
 # Each segment maps to a tmux user option: @claude_{segment} / @claude_window_{segment}
 # Default order if theme.json missing: persona voice hook
@@ -65,6 +67,10 @@ build_segments() {
             else
                 result="${result}#{?#{@claude_window_voice},#{@claude_window_voice},#{?#{${var}},#{${var}},}}"
             fi
+        elif [ "$seg" = "agents" ]; then
+            local agents_color
+            agents_color=$(jq -r '.semantic_colors[.states.agents.semantic] // "#cba6f7"' "$THEME_FILE" 2>/dev/null)
+            result="${result}#{?#{${var}},#[fg=${agents_color:-#cba6f7}]#{${var}}#[fg=${fg_restore}],}"
         else
             result="${result}#{?#{${var}},#{${var}},}"
         fi
@@ -72,9 +78,19 @@ build_segments() {
     echo "#[fg=#{@claude_${prefix}color}]#{@claude_${prefix}state}#[fg=${fg_restore}]${result} "
 }
 
-PANE_IND=$(build_segments "" "default")
-WIN_IND=$(build_segments "window_" "default")
-INDICATOR="#{?#{@claude_window_state},${WIN_IND},#{?#{@claude_state},${PANE_IND}, }}"
+# Tabs have one lifecycle badge. Native state names whitelist the approved
+# grammar so stale persona/tool/unknown glyphs can never leak into the tab.
+build_tab_marker() {
+    local state="#{@claude_${1}state_name}"
+    local glyph="#{@claude_${1}state}"
+    local named="#{?#{==:${state},idle},🔵,#{?#{==:${state},unread},🔵,#{?#{==:${state},nudge},🔵,#{?#{==:${state},asking},🔵,#{?#{==:${state},working},🟢,#{?#{==:${state},agents},💠,}}}}}}"
+    local fallback="#{?#{==:${glyph},🔵},🔵,#{?#{==:${glyph},🟢},🟢,#{?#{==:${glyph},💠},💠,}}}"
+    echo "#{?${state},${named},${fallback}} "
+}
+
+PANE_IND=$(build_tab_marker "")
+WIN_IND=$(build_tab_marker "window_")
+INDICATOR="#{?#{@claude_window_state_name},${WIN_IND},#{?#{@claude_window_state},${WIN_IND},#{?#{@claude_state},${PANE_IND}, }}}"
 
 # Strip either the old pane-first or current window-first indicator before #I.
 # Nested #{...} makes regex unreliable, so find the marker and splice.
@@ -82,7 +98,7 @@ strip_claude_indicator() {
     python3 -c "
 import sys
 s = sys.stdin.read()
-markers = ('#{?#{@claude_state}', '#{?#{@claude_window_state}')
+markers = ('#{?#{@claude_state}', '#{?#{@claude_window_state}', '#{?#{@claude_window_state_name}')
 indices = [s.find(marker) for marker in markers if marker in s]
 idx = min(indices) if indices else -1
 if idx < 0:
@@ -108,9 +124,7 @@ BASE_WSCF=$(strip_claude_indicator "$CURRENT_WSCF")
 CURRENT_FG=$(echo "$BASE_WSCF" | sed 's/#I.*//' | grep -oP 'fg=#[0-9a-fA-F]{6}' | tail -1 | cut -d= -f2)
 CURRENT_FG="${CURRENT_FG:-default}"
 
-PANE_IND_CUR=$(build_segments "" "$CURRENT_FG" "1")
-WIN_IND_CUR=$(build_segments "window_" "$CURRENT_FG" "1")
-INDICATOR_CURRENT="#{?#{@claude_window_state},${WIN_IND_CUR},#{?#{@claude_state},${PANE_IND_CUR}, }}"
+INDICATOR_CURRENT="$INDICATOR"
 
 # Insert before #I; strip #F (last-window flag is visual noise)
 NEW_WSF=$(echo "$BASE_WSF" | sed "s|#F||" | sed "s|#I|${INDICATOR}#I|")
@@ -126,6 +140,23 @@ tmux set -g window-status-format "$NEW_WSF"
 tmux set -g window-status-current-format "$NEW_WSCF"
 tmux set -g status-fg "#8a8a8a"
 
+# Keep Shawn's full date/time widgets, replacing only the cached strftime
+# expansions with the existing clock helper's fresh local-time processes.
+CLOCK_SCRIPT="$HOME/.config/tmux/scripts/status-clock.sh"
+CLOCK_RIGHT=""
+if [ -x "$CLOCK_SCRIPT" ]; then
+    CURRENT_SR=$(tmux show-option -gv status-right 2>/dev/null)
+    CLOCK_RIGHT=$(python3 - "$CLOCK_SCRIPT" "$CURRENT_SR" <<'PY'
+import shlex
+import sys
+command = shlex.quote(sys.argv[1])
+print(sys.argv[2].replace('%A %B %d %F', '#(' + command + ' date)')
+      .replace('%H:%M %Z', '#(' + command + ' time)'), end='')
+PY
+)
+    tmux set -g status-right "$CLOCK_RIGHT"
+fi
+
 # --- Session persona icon in status-left ---
 if [ -f "$THEME_FILE" ] && command -v jq >/dev/null 2>&1; then
     CURRENT_SL=$(tmux show-option -gv status-left 2>/dev/null)
@@ -140,8 +171,11 @@ fi
 
 # Terminal title (for Alacritty/WezTerm window title bars)
 if [ "$(tmux show-option -gqv @claude_tmux_set_titles 2>/dev/null)" != "off" ]; then
+    TITLE_PANE_IND=$(build_segments "" "default")
+    TITLE_WIN_IND=$(build_segments "window_" "default")
+    TITLE_INDICATOR="#{?#{@claude_window_state},${TITLE_WIN_IND},#{?#{@claude_state},${TITLE_PANE_IND}, }}"
     tmux set -g set-titles on
-    tmux set -g set-titles-string "#S | ${INDICATOR}#I:#W"
+    tmux set -g set-titles-string "#S | ${TITLE_INDICATOR}#I:#W"
 fi
 
 # --- Write persistent dynamic config ---
@@ -157,6 +191,13 @@ set -g window-status-current-format "$NEW_WSCF"
 set -g status-fg "#8a8a8a"
 set -g status-left "$FINAL_SL"
 DYNEOF
+if [ -n "$CLOCK_RIGHT" ]; then
+    python3 - "$CLOCK_RIGHT" >> "$DYNAMIC_CONF" <<'PY'
+import json
+import sys
+print('set -g status-right ' + json.dumps(sys.argv[1], ensure_ascii=False))
+PY
+fi
 
 # --- END format string injection ---
 

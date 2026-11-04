@@ -1149,6 +1149,7 @@ class TmuxWriter:
     _PRIORITY = {"working": 70, "agents": 60, "asking": 50, "error": 40,
                  "unread": 30, "unknown": 20, "nudge": 20, "idle": 10}
     _FIELDS = ("state_name", "state", "color", "persona", "hook", "focus", "agents")
+    _theme = ThemeLoader()
 
     @staticmethod
     def _run(cmd: list[str]) -> bool:
@@ -1204,7 +1205,7 @@ class TmuxWriter:
 
     @classmethod
     def _window_options(cls, siblings: dict) -> list[tuple]:
-        """Choose one sibling deterministically, preserving its whole badge."""
+        """Keep active delegation visible across every sibling in a window."""
         # Old hook fallbacks only write color/glyph. Resolve those through the
         # current theme rather than treating every legacy pane as idle.
         colors = {"#a6e3a1": "working", "#cba6f7": "agents", "#f9e2af": "asking",
@@ -1221,10 +1222,14 @@ class TmuxWriter:
             pane_id, options = item
             name = options.get("state_name") or colors.get(options.get("color"), "unknown")
             # Lower stable pane ID wins ties, regardless of focus/list ordering.
-            return (-cls._PRIORITY.get(name, 20), int(pane_id.lstrip("%")))
+            delegated = bool(options.get("agents")) or name == "agents"
+            return (-int(delegated), -cls._PRIORITY.get(name, 20), int(pane_id.lstrip("%")))
 
         candidates = [item for item in siblings.items() if item[1].get("state")]
-        winner = min(candidates, key=rank)[1] if candidates else {}
+        winner = dict(min(candidates, key=rank)[1]) if candidates else {}
+        if winner.get("agents") or winner.get("state_name") == "agents":
+            state, color, glyph = cls._theme.resolve_state("agents")
+            winner.update(state_name=state, state=glyph, color=color)
         return [("w", "@claude_window_" + field, winner.get(field) or None)
                 for field in cls._FIELDS]
 
@@ -1255,7 +1260,8 @@ class TmuxWriter:
         if snapshot is None:
             return
         current, siblings = snapshot
-        agents = ("◉" if pane.active_agent_count == 1 else f"◉{pane.active_agent_count}") \
+        agent_glyph = cls._theme.resolve_state("agents")[2]
+        agents = (agent_glyph if pane.active_agent_count == 1 else f"{agent_glyph}{pane.active_agent_count}") \
             if pane.active_agent_count > 0 else None
         desired = [
             ("p", "@claude_state_name", pane.state_name),
@@ -2065,8 +2071,14 @@ class TmuxArbiter:
                     state = "unread"
             _, color, glyph = self.theme.resolve_state(state)
             source = evidence.get("source", "native")
+            active_agent_count = (prev.active_agent_count if prev and same_execution
+                                  and state == "working" else 0)
+            if provider == "codex" and "child_count_known" in evidence:
+                active_agent_count = (max(0, int(evidence.get("active_agent_count", 0)))
+                                      if evidence["child_count_known"] else 0)
             if (prev and prev.state_name == state and prev.lifecycle_identity == identity
-                    and prev.lifecycle_source == source and prev.color == color and prev.glyph == glyph):
+                    and prev.lifecycle_source == source and prev.color == color and prev.glyph == glyph
+                    and prev.active_agent_count == active_agent_count):
                 continue
             history = self._record_event(prev, "native_lifecycle", prev.state_name, state, "reconcile") if prev else []
             if prev:
@@ -2078,12 +2090,13 @@ class TmuxArbiter:
                                    and state == "unknown" and prev.lifecycle_unread and pane_id != focused)),
                                event_history=history,
                                subagent_depth=prev.subagent_depth if state == "working" and same_execution else 0,
-                               active_agent_count=prev.active_agent_count if state == "working" and same_execution else 0)
+                               active_agent_count=active_agent_count)
             else:
                 pane = PaneState(pane_id, state, color, glyph,
                                  self.theme.get_persona_emoji(provider, self.emoji), now, 0,
                                  provider=provider, last_source="reconcile",
-                                 lifecycle_source=source, lifecycle_identity=identity)
+                                 lifecycle_source=source, lifecycle_identity=identity,
+                                 active_agent_count=active_agent_count)
             self.panes[pane_id] = pane
             TmuxWriter.write_state(pane)
             corrections += 1
@@ -2093,8 +2106,9 @@ class TmuxArbiter:
             if failed:
                 # A failed reader does not prove an exit or a quiet model.
                 _, color, glyph = self.theme.resolve_state("unknown")
-                if prev.state_name != "unknown":
-                    pane = replace(prev, state_name="unknown", color=color, glyph=glyph, updated_at=now)
+                if prev.state_name != "unknown" or prev.active_agent_count:
+                    pane = replace(prev, state_name="unknown", color=color, glyph=glyph, updated_at=now,
+                                   active_agent_count=0)
                     self.panes[pane_id] = pane
                     TmuxWriter.write_state(pane)
                     corrections += 1

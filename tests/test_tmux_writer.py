@@ -56,9 +56,9 @@ def tmux_writer(tmp_path, monkeypatch):
             [*cmd, "display-message", "-p", "#{pane_id}"], text=True,
         ).strip()
         pane = mod.PaneState(
-            pane_id=pane_id, state_name="working", color="#a6e3a1", glyph="⬤",
+            pane_id=pane_id, state_name="working", color="#a6e3a1", glyph="🟢",
             persona="⌘", updated_at=time.time(), session_start_at=0,
-            hook_emoji="🔧  ", focus_emoji="🌱", active_agent_count=2,
+            hook_emoji="🔧  ", focus_emoji="🌱", active_agent_count=0,
         )
 
         def terminal_output():
@@ -185,7 +185,7 @@ def test_idle_sibling_cannot_replace_working_badge(tmux_writer):
     assert option(cmd, "@claude_window_color", idle.pane_id) == working.color
     assert option(cmd, "@claude_window_persona", idle.pane_id) == working.persona
     assert option(cmd, "@claude_window_hook", idle.pane_id) == working.hook_emoji
-    assert option(cmd, "@claude_window_agents", idle.pane_id) == "◉2"
+    assert option(cmd, "@claude_window_agents", idle.pane_id) == ""
     # The aggregate follows the next sibling after the working pane finishes.
     mod.TmuxWriter.write_state(replace(working, state_name="idle", color="#89b4fa",
                                       persona="", hook_emoji="finished", active_agent_count=0,
@@ -196,8 +196,23 @@ def test_idle_sibling_cannot_replace_working_badge(tmux_writer):
     assert option(cmd, "@claude_window_agents", idle.pane_id) == ""
 
 
+def test_other_working_pane_cannot_hide_running_children(tmux_writer):
+    mod, cmd, ceo, output = tmux_writer
+    cto = replace(ceo, pane_id=split_pane(cmd), active_agent_count=2, persona="CTO")
+    mod.TmuxWriter.write_state(cto)
+    mod.TmuxWriter.write_state(ceo)
+    assert option(cmd, "@claude_window_state_name", ceo.pane_id) == "agents"
+    assert option(cmd, "@claude_window_state", ceo.pane_id) == "💠"
+    assert option(cmd, "@claude_state_name", cto.pane_id, "p") == "working"
+    assert option(cmd, "@claude_window_agents", ceo.pane_id) == "💠2"
+    mod.TmuxWriter.write_state(replace(cto, active_agent_count=0))
+    assert option(cmd, "@claude_window_state_name", ceo.pane_id) == "working"
+    assert option(cmd, "@claude_window_state", ceo.pane_id) == "🟢"
+    assert option(cmd, "@claude_window_agents", ceo.pane_id) == ""
+
+
 @pytest.mark.parametrize("names", [
-    ("working", "agents"), ("agents", "asking"), ("asking", "error"),
+    ("agents", "working"), ("agents", "asking"), ("asking", "error"),
     ("error", "unread"), ("unread", "unknown"), ("unknown", "idle"),
 ])
 def test_window_priority_uses_semantic_state(tmux_writer, names):
@@ -308,7 +323,7 @@ def test_focus_script_clears_legacy_unread_without_daemon(tmux_writer, script_en
     subprocess.run([*cmd, "set", "-p", "@claude_color", "#b4befe"], check=True)
     run_script("tmux-window-state.sh", script_env)
     assert option(cmd, "@claude_state_name", pane.pane_id, "p") == "idle"
-    assert option(cmd, "@claude_state", pane.pane_id, "p") == "⬤"
+    assert option(cmd, "@claude_state", pane.pane_id, "p") == "🔵"
     assert option(cmd, "@claude_window_color", pane.pane_id) == "#89b4fa"
 
 
@@ -350,7 +365,7 @@ def test_focus_script_delegates_to_daemon_and_falls_back_for_old_protocol(
     assert option(cmd, "@claude_window_color", pane.pane_id) == expected
 
 
-def test_setup_renders_aggregate_with_pane_specific_current_voice(tmux_writer, script_env):
+def test_setup_renders_only_lifecycle_grammar_and_preserves_voice_options(tmux_writer, script_env):
     mod, cmd, working, output = tmux_writer
     idle = replace(working, pane_id=split_pane(cmd), state_name="idle", color="#89b4fa",
                    persona="idle-persona", hook_emoji="idle-event")
@@ -369,12 +384,14 @@ def test_setup_renders_aggregate_with_pane_specific_current_voice(tmux_writer, s
         [*cmd, "display-message", "-p", "-t", idle.pane_id, "#{E:" + name + "}"], text=True,
     ) for name in ("window-status-current-format", "window-status-format")]
     for rendered in (current, other):
-        assert "#[fg=#a6e3a1]⬤" in rendered
-        assert working.persona in rendered
-        assert working.hook_emoji in rendered
+        assert "🟢" in rendered
+        assert working.persona not in rendered
+        assert working.hook_emoji not in rendered
         assert "idle-persona" not in rendered
-    assert "🎤" in current and "🌟" not in current
-    assert "🌟" in other and "🎤" not in other
+        assert "🎤" not in rendered and "🌟" not in rendered
+        assert working.focus_emoji not in rendered
+    assert option(cmd, "@claude_voice", idle.pane_id, "p") == "🎤"
+    assert option(cmd, "@claude_window_voice", idle.pane_id) == "🌟"
     assert "legacy" not in other
     assert "#[fg=#fffafa]" in current
     run_script("claude-tmux-setup.sh", script_env)
@@ -391,7 +408,9 @@ def test_setup_renders_aggregate_with_pane_specific_current_voice(tmux_writer, s
         [*cmd, "display-message", "-p", "-t", idle.pane_id,
          "#{E:window-status-current-format}"], text=True,
     )
-    assert "🌟" in current
+    assert "🌟" not in current
+    assert "🔵" in current
+    assert option(cmd, "@claude_window_voice", idle.pane_id) == "🌟"
     output()
 
 

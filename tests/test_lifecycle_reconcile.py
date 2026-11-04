@@ -45,6 +45,39 @@ def test_quiet_native_turn_stays_working_without_new_events(arbiter):
     assert len(writes) == 1, "unchanged native state must not churn terminal selection"
 
 
+def test_native_children_update_without_root_state_change(arbiter):
+    _, arb, evidence, writes, _ = arbiter
+    evidence["%8"].update(child_count_known=True, active_agent_count=2)
+    arb.reconcile_lifecycle()
+    assert arb.panes["%8"].active_agent_count == 2
+    assert arb.reconcile_lifecycle() == 0
+    evidence["%8"]["active_agent_count"] = 1
+    assert arb.reconcile_lifecycle() == 1
+    assert writes[-1].active_agent_count == 1
+    evidence["%8"]["active_agent_count"] = 0
+    arb.reconcile_lifecycle()
+    assert arb.panes["%8"].active_agent_count == 0
+
+
+def test_incomplete_child_evidence_removes_stale_marker(arbiter):
+    _, arb, evidence, _, _ = arbiter
+    evidence["%8"].update(child_count_known=True, active_agent_count=2)
+    arb.reconcile_lifecycle()
+    evidence["%8"].pop("active_agent_count")
+    evidence["%8"]["child_count_known"] = False
+    arb.reconcile_lifecycle()
+    assert arb.panes["%8"].state_name == "working"
+    assert arb.panes["%8"].active_agent_count == 0
+
+
+def test_idle_parent_can_still_have_native_active_children(arbiter):
+    _, arb, evidence, _, _ = arbiter
+    evidence["%8"].update(state="idle", child_count_known=True, active_agent_count=1)
+    arb.reconcile_lifecycle()
+    assert arb.panes["%8"].state_name == "idle"
+    assert arb.panes["%8"].active_agent_count == 1
+
+
 def test_actual_completion_is_unread_until_viewed(arbiter):
     _, arb, evidence, _, _ = arbiter
     arb.reconcile_lifecycle()
@@ -67,13 +100,15 @@ def test_new_process_does_not_inherit_old_completion(arbiter):
 
 
 def test_native_reader_failure_is_unknown_never_idle(arbiter):
-    _, arb, _, _, clears = arbiter
+    _, arb, evidence, _, clears = arbiter
+    evidence["%8"].update(child_count_known=True, active_agent_count=2)
     arb.reconcile_lifecycle()
     def fail(_):
         raise OSError("fixture read failed")
     arb.lifecycle_collectors = [SimpleNamespace(poll=fail)]
     arb.reconcile_lifecycle()
     assert arb.panes["%8"].state_name == "unknown"
+    assert arb.panes["%8"].active_agent_count == 0
     assert clears == []
 
 

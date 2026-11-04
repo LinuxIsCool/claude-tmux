@@ -39,7 +39,7 @@ def claude_record(collector, process, **changes):
     write(collector.home / ".claude/sessions/12.json", record)
 
 
-@pytest.mark.parametrize("native,expected", [("busy", "working"), ("shell", "working"),
+@pytest.mark.parametrize("native,expected", [("busy", "working"), ("shell", "idle"),
     ("idle", "idle"), ("waiting", "asking"), ("unrecognized", "unknown")])
 def test_native_claude_status_does_not_expire_during_quiet_wait(environment, native, expected):
     collector, process, processes = environment

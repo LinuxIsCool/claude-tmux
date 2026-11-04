@@ -296,7 +296,9 @@ class Collector:
         raw = (self.proc_root / str(process.pid) / "stat").read_text()
         if raw[raw.rindex(")") + 2:].split()[19] != process.start:
             return {}
-        state = {"busy": "working", "shell": "working", "idle": "idle", "waiting": "asking"}
+        # Claude publishes shell only when its base state is idle and a
+        # background shell remains. It does not mean the model is generating.
+        state = {"busy": "working", "shell": "idle", "idle": "idle", "waiting": "asking"}
         return {"state": state.get(record.get("status"), "unknown"), "source": "claude-session",
                 "session_id": str(record.get("sessionId", "")), "source_path": str(path),
                 "observed_at": _timestamp(record.get("statusUpdatedAt")), "native_status": record.get("status")}

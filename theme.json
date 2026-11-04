@@ -15,17 +15,17 @@
   "states": {
     "working": {
       "semantic": "active",
-      "glyph": "⬤",
+      "glyph": "🟢",
       "label": "Claude is generating"
     },
     "idle": {
       "semantic": "ready",
-      "glyph": "⬤",
+      "glyph": "🔵",
       "label": "Awaiting input"
     },
     "agents": {
       "semantic": "delegated",
-      "glyph": "◉",
+      "glyph": "💠",
       "label": "Subagent active"
     },
     "asking": {
