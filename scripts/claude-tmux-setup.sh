@@ -246,16 +246,3 @@ if [ -f "$RESAVE_SCRIPT" ]; then
         reinstall_own_hook "$evt" "run-shell -b '$RESAVE_SCRIPT'" "$RESAVE_SCRIPT"
     done
 fi
-
-# Use the full client width for readable window rows. The arbiter refreshes
-# this same projection, including its fresh external clock, once per poll.
-# Reapply it after a theme reload or plugins-dynamic.conf restoration as well.
-STATUS_BAR_SCRIPT="$(cd "$(dirname "$0")" && pwd)/tmux_status_bar.py"
-if [ -f "$STATUS_BAR_SCRIPT" ]; then
-    python3 "$STATUS_BAR_SCRIPT"
-    python3 - "$STATUS_BAR_SCRIPT" >> "$DYNAMIC_CONF" <<'PY'
-import shlex
-import sys
-print("run-shell " + shlex.quote("python3 " + shlex.quote(sys.argv[1])))
-PY
-fi
