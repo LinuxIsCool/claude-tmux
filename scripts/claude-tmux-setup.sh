@@ -41,7 +41,10 @@ build_segments() {
     local result=""
     for seg in $segments; do
         local var="@claude_${prefix}${seg}"
-        if [ "$prefix" = "" ] && [ "$seg" = "voice" ]; then
+        if [ "$seg" = "voice" ]; then
+            # Lifecycle segments use the winning sibling, but voice continues
+            # to follow the voice arbiter's own pane/window selection rules.
+            var="@claude_voice"
             # window-status-format renders in the ACTIVE pane's context. Voice
             # is a window-scoped question for every OTHER window in the status
             # bar ("is anyone in this tab talking?"), so window-status-format
@@ -71,17 +74,17 @@ build_segments() {
 
 PANE_IND=$(build_segments "" "default")
 WIN_IND=$(build_segments "window_" "default")
-INDICATOR="#{?#{@claude_state},${PANE_IND},#{?#{@claude_window_state},${WIN_IND}, }}"
+INDICATOR="#{?#{@claude_window_state},${WIN_IND},#{?#{@claude_state},${PANE_IND}, }}"
 
-# Strip previously-injected indicator block. The indicator sits between
-# #{?#{@claude_state}... and #I. Nested #{...} makes regex unreliable,
-# so we use python string slicing: find marker start, rfind #I, splice.
+# Strip either the old pane-first or current window-first indicator before #I.
+# Nested #{...} makes regex unreliable, so find the marker and splice.
 strip_claude_indicator() {
     python3 -c "
 import sys
 s = sys.stdin.read()
-marker = '#{?#{@claude_state}'
-idx = s.find(marker)
+markers = ('#{?#{@claude_state}', '#{?#{@claude_window_state}')
+indices = [s.find(marker) for marker in markers if marker in s]
+idx = min(indices) if indices else -1
 if idx < 0:
     print(s, end='')
 else:
@@ -106,8 +109,8 @@ CURRENT_FG=$(echo "$BASE_WSCF" | sed 's/#I.*//' | grep -oP 'fg=#[0-9a-fA-F]{6}' 
 CURRENT_FG="${CURRENT_FG:-default}"
 
 PANE_IND_CUR=$(build_segments "" "$CURRENT_FG" "1")
-WIN_IND_CUR=$(build_segments "window_" "$CURRENT_FG")
-INDICATOR_CURRENT="#{?#{@claude_state},${PANE_IND_CUR},#{?#{@claude_window_state},${WIN_IND_CUR}, }}"
+WIN_IND_CUR=$(build_segments "window_" "$CURRENT_FG" "1")
+INDICATOR_CURRENT="#{?#{@claude_window_state},${WIN_IND_CUR},#{?#{@claude_state},${PANE_IND_CUR}, }}"
 
 # Insert before #I; strip #F (last-window flag is visual noise)
 NEW_WSF=$(echo "$BASE_WSF" | sed "s|#F||" | sed "s|#I|${INDICATOR}#I|")
@@ -187,9 +190,8 @@ reinstall_own_hook() {
 }
 
 # --- Split-pane indicator preservation ---
-# When focus moves between panes, scan the window for any Claude pane and copy
-# its state to window-level fallback options. The format string cascades:
-# pane @claude_state -> window @claude_window_state -> empty.
+# Focus and pane-removal hooks share the arbiter's window aggregation rules.
+# The lifecycle aggregate wins over the selected pane's state.
 WINDOW_STATE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/tmux-window-state.sh"
 if [ -f "$WINDOW_STATE_SCRIPT" ]; then
     # after-select-pane: fires on pane switch within a window
@@ -197,12 +199,20 @@ if [ -f "$WINDOW_STATE_SCRIPT" ]; then
     # after-select-window: fires on window switch — needed for unread→read
     # (visiting an unread window via Ctrl-B N doesn't trigger after-select-pane)
     reinstall_own_hook after-select-window "run-shell -b '$WINDOW_STATE_SCRIPT'" "$WINDOW_STATE_SCRIPT"
+    # A removed winning pane must immediately reveal the next live sibling.
+    for evt in after-kill-pane pane-exited; do
+        reinstall_own_hook "$evt" "run-shell -b '$WINDOW_STATE_SCRIPT #{window_id}'" "$WINDOW_STATE_SCRIPT"
+    done
 fi
 
 # Self-healing: clear stale indicators when a pane's process dies
 # Uses tmux native conditional — only fires if the dying pane had an indicator
 # Also notifies voice arbiter to clean up voice state for the dead pane
-tmux set-hook -g pane-died 'if -F "#{@claude_state}" "set -pu @claude_state ; set -pu @claude_color ; set -pu @claude_persona ; set -pu @claude_hook ; set -pu @claude_voice ; set -pu @claude_focus ; run-shell -b \"echo {\\\"type\\\":\\\"pane_died\\\",\\\"pane_id\\\":\\\"#{pane_id}\\\"} | socat -t0.1 - UNIX-CONNECT:$HOME/.claude/local/voice/arbiter.sock 2>/dev/null || true\""'
+tmux set-hook -g pane-died 'if -F "#{@claude_state}" "set -pu @claude_state ; set -pu @claude_state_name ; set -pu @claude_color ; set -pu @claude_persona ; set -pu @claude_hook ; set -pu @claude_focus ; set -pu @claude_agents ; run-shell -b \"echo {\\\"type\\\":\\\"pane_died\\\",\\\"pane_id\\\":\\\"#{pane_id}\\\"} | socat -t0.1 - UNIX-CONNECT:$HOME/.claude/local/voice/arbiter.sock 2>/dev/null || true\""'
+
+if [ -f "$WINDOW_STATE_SCRIPT" ]; then
+    reinstall_own_hook pane-died "run-shell -b '$WINDOW_STATE_SCRIPT #{window_id}'" "$WINDOW_STATE_SCRIPT"
+fi
 
 # --- Layout-change re-save (Fix 5, 2026-04-27) -----------------------------
 # Position-keyed state files (legion:5.1.state) drift whenever windows OR

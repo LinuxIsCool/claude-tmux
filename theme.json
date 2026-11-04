@@ -47,6 +47,11 @@
       "semantic": "nudge",
       "glyph": "⬤",
       "label": "Idle nudge"
+    },
+    "unknown": {
+      "semantic": "muted",
+      "glyph": "○",
+      "label": "Agent lifecycle unavailable"
     }
   },
   "hook_to_state": {

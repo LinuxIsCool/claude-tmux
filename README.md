@@ -17,9 +17,11 @@ Claude Code fires hook
           → window-status-format  →  ⬤ 5:my-project
 ```
 
-The arbiter is a daemon-owned Moore state machine. Hooks are thin forwarders; if the daemon is down, hooks fall back to direct tmux writes. Multi-signal detection (CPU sampling + child-process age) covers resumed sessions whose hooks predate the current install. Hysteresis and reconciliation loops prevent flicker and stuck states.
+The arbiter owns state and aggregates every pane in a window. A working sibling stays visible when an idle pane is selected. Hooks are thin forwarders; if the daemon is down, hooks fall back to direct tmux writes.
 
-Seven states, all defined in `theme.json` (semantic colors, glyphs, hook-to-state mapping): idle, unread, working, agents, asking, error, nudge. `unread` is the one that changes how you work: a finished response in an unfocused window shows lavender until you actually visit it.
+On Linux, native lifecycle readers also cover existing Claude Code and Codex sessions without restarting them. Claude's process registration supplies current activity. Codex's held root rollout and writer lock bind native turn boundaries to the actual CLI. These readers preserve working during silent provider waits. CPU inactivity does not override their state. Missing, ambiguous or damaged evidence displays a hollow muted circle (`unknown`).
+
+Eight states are defined in `theme.json`: idle, unread, working, agents, asking, error, nudge and unknown. A finished response in an unfocused window shows lavender until you visit it. The aggregate prioritizes working and delegated work before input requests, errors and idle panes.
 
 Optional segments enrich the tabs when their data sources exist: persona emoji, hook-event emoji (two-slot grammar, e.g. 🔧📖 for "reading a file"), and a focus indicator resolving which project the session is working in. All degrade to nothing when absent.
 
@@ -62,6 +64,20 @@ set -g @resurrect-processes '"~claude->~/claude-tmux/scripts/claude-restore.sh"'
 set -g @resurrect-hook-post-save-layout '~/claude-tmux/scripts/claude-save-sessions.sh'
 ```
 
+### Pi and Oh My Pi lifecycle
+
+Install the metadata-only native extension from this checkout:
+
+```bash
+mkdir -p ~/.pi/agent/extensions ~/.omp/agent/extensions
+cp scripts/pi-lifecycle-extension.ts ~/.pi/agent/extensions/legion-tmux.ts
+cp scripts/pi-lifecycle-extension.ts ~/.omp/agent/extensions/legion-tmux.ts
+```
+
+Ordinary new sessions discover it automatically. For a custom agent directory, install it in that directory's `extensions/` folder. A launch using `--no-extensions` needs an explicit `--extension /path/to/pi-lifecycle-extension.ts`. Existing processes keep their loaded extensions and are never restarted by the arbiter.
+
+The extension writes atomic lifecycle metadata under the configured agent directory. The reader checks process start time, PID namespace and session identity. Pi completion uses `agent_settled`; Oh My Pi uses its settled `agent_end` boundary and continuation flags. Message persistence alone does not establish turn completion, so sessions without native evidence remain unknown. Arbitrary extension-owned dialogs have no generic input-wait event and are not inferred from transcript text.
+
 ## Configuration
 
 Defaults ship in `config.json` and `theme.json`. Machine-local overrides (never touched by updates) live at `~/.claude/local/tmux/config.json` and `~/.claude/local/tmux/theme.json`. Hot-reload with `kill -HUP $(cat ~/.claude/local/tmux/arbiter.pid)`.
@@ -76,7 +92,7 @@ bun test                                                           # web topolog
 bash tests/test_tombstone_gc.sh && bash tests/test_claude_restore.sh
 ```
 
-Four suites, 271 tests, all self-contained (no host state required; host-integration tests skip cleanly when optional data is absent).
+Tests use disposable state and isolated tmux servers. Native Pi and Oh My Pi checks use a loopback test provider with a silent response interval, require no paid inference, and skip when the corresponding CLI is unavailable. Host-integration tests skip when optional data is absent.
 
 ## License
 

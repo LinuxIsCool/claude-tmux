@@ -1044,6 +1044,9 @@ class PaneState:
     focus_signals: list = field(default_factory=list)  # list of FocusSignal dicts for persistence
     provider: str = "claude"  # event adapter that owns lifecycle semantics
     active_agent_count: int = 0  # Codex subagents are an orthogonal decoration
+    lifecycle_source: str = ""  # process-bound native lifecycle reader
+    lifecycle_identity: str = ""  # PID/start/session, protects pane reuse
+    lifecycle_unread: bool = False  # survives temporary native-reader failure
 
 
 # ---------------------------------------------------------------------------
@@ -1142,6 +1145,11 @@ class ThemeLoader:
 class TmuxWriter:
     """Project indicator changes in one batch. Failures are logged, never raised."""
 
+    # Active work must remain visible even when the selected sibling is idle.
+    _PRIORITY = {"working": 70, "agents": 60, "asking": 50, "error": 40,
+                 "unread": 30, "unknown": 20, "nudge": 20, "idle": 10}
+    _FIELDS = ("state_name", "state", "color", "persona", "hook", "focus", "agents")
+
     @staticmethod
     def _run(cmd: list[str]) -> bool:
         """Run a tmux command. Returns True on success."""
@@ -1156,27 +1164,26 @@ class TmuxWriter:
             return False
 
     @classmethod
-    def write_state(cls, pane: PaneState) -> None:
-        """Read tmux's current options, then batch only changed indicators.
-
-        Also updates window-level fallback options for split-pane support.
-        NEVER touches @claude_voice — that option belongs to voice_arbiter.py.
-        Empty hook emoji preserves the last event. Empty pane persona clears it.
-        """
-        t = pane.pane_id
+    def _snapshot(cls, t: str) -> tuple[dict, dict] | None:
+        """Read the projection and every sibling from the target's window."""
         marker = "__claude_window_options__"
+        siblings_marker = "__claude_sibling_options__"
+        pane_format = "\t".join(["#{pane_id}"] + ["#{@claude_" + f + "}" for f in cls._FIELDS])
         try:
             result = subprocess.run(
                 [*TMUX_CMD, "show-options", "-p", "-t", t, ";",
                  "display-message", "-p", "-t", t, marker, ";",
-                 "show-options", "-w", "-t", t],
+                 "show-options", "-w", "-t", t, ";",
+                 "display-message", "-p", "-t", t, siblings_marker, ";",
+                 "list-panes", "-t", t, "-F", pane_format],
                 capture_output=True, text=True, timeout=0.3,
             )
             if result.returncode != 0:
                 _log(f"tmux option read failed for {t}: {result.stderr.strip()}")
                 return
             pane_text, separator, window_text = result.stdout.partition(marker + "\n")
-            if not separator:
+            window_text, siblings_separator, sibling_text = window_text.partition(siblings_marker + "\n")
+            if not separator or not siblings_separator:
                 _log(f"tmux option read incomplete for {t}")
                 return
             current = {}
@@ -1185,35 +1192,45 @@ class TmuxWriter:
                     if line.startswith("@"):
                         name, value = shlex.split(line)
                         current[scope, name] = value
+            siblings = {}
+            for line in sibling_text.splitlines():
+                parts = line.split("\t")
+                if len(parts) == len(cls._FIELDS) + 1:
+                    siblings[parts[0]] = dict(zip(cls._FIELDS, parts[1:]))
+            return current, siblings
         except Exception as e:
             _log(f"tmux option read failed for {t}: {e}")
             return
 
-        agents = ("◉" if pane.active_agent_count == 1 else f"◉{pane.active_agent_count}") \
-            if pane.active_agent_count > 0 else None
-        desired = [
-            ("p", "@claude_state", pane.glyph),
-            ("p", "@claude_color", pane.color),
-            ("p", "@claude_persona", pane.persona or None),
-            ("w", "@claude_window_state", pane.glyph),
-            ("w", "@claude_window_color", pane.color),
-            ("p", "@claude_focus", pane.focus_emoji or None),
-            ("w", "@claude_window_focus", pane.focus_emoji or None),
-            ("p", "@claude_agents", agents),
-            ("w", "@claude_window_agents", agents),
-        ]
-        if pane.persona:
-            desired.append(("w", "@claude_window_persona", pane.persona))
-        if pane.hook_emoji:
-            desired.extend([
-                ("p", "@claude_hook", pane.hook_emoji),
-                ("w", "@claude_window_hook", pane.hook_emoji),
-            ])
+    @classmethod
+    def _window_options(cls, siblings: dict) -> list[tuple]:
+        """Choose one sibling deterministically, preserving its whole badge."""
+        # Old hook fallbacks only write color/glyph. Resolve those through the
+        # current theme rather than treating every legacy pane as idle.
+        colors = {"#a6e3a1": "working", "#cba6f7": "agents", "#f9e2af": "asking",
+                  "#f38ba8": "error", "#b4befe": "unread", "#89b4fa": "idle",
+                  "#6699cc": "nudge", "#6c7086": "unknown"}
+        try:
+            theme = json.loads(THEME_PATH.read_text())
+            for name, state in theme["states"].items():
+                colors[theme["semantic_colors"][state["semantic"]]] = name
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
 
-        # Each set-option requests a full client redraw, even for unchanged
-        # values. One command queue avoids intermediate indicator frames.
-        # Read actual options every time so external drift and failed writes
-        # are repaired on the next event rather than hidden by an intent cache.
+        def rank(item):
+            pane_id, options = item
+            name = options.get("state_name") or colors.get(options.get("color"), "unknown")
+            # Lower stable pane ID wins ties, regardless of focus/list ordering.
+            return (-cls._PRIORITY.get(name, 20), int(pane_id.lstrip("%")))
+
+        candidates = [item for item in siblings.items() if item[1].get("state")]
+        winner = min(candidates, key=rank)[1] if candidates else {}
+        return [("w", "@claude_window_" + field, winner.get(field) or None)
+                for field in cls._FIELDS]
+
+    @classmethod
+    def _apply(cls, t: str, current: dict, desired: list[tuple]) -> None:
+        """Batch only changed options so stable polling never redraws clients."""
         cmd = list(TMUX_CMD)
         for scope, name, value in desired:
             if current.get((scope, name)) == value:
@@ -1227,42 +1244,53 @@ class TmuxWriter:
             cls._run(cmd)
 
     @classmethod
-    def clear_state(cls, pane_id: str) -> None:
-        """Clear all claude indicator options for a pane (SessionEnd).
+    def write_state(cls, pane: PaneState) -> None:
+        """Update the pane and its window's highest-priority lifecycle badge.
 
-        If sibling panes in the same window still have @claude_state, copies
-        the first match to window-level options. Otherwise clears them.
-        Also clears @claude_voice — session is gone, no voice state to show.
+        NEVER touches voice options, including the voice window aggregate.
+        Empty hook emoji preserves the last event. Empty persona clears it.
         """
-        for opt in ("@claude_state", "@claude_color", "@claude_persona", "@claude_hook", "@claude_voice", "@claude_focus", "@claude_agents"):
-            cls._run([*TMUX_CMD, "set", "-pu", "-t", pane_id, opt])
-        # Check if any sibling pane still has claude state
-        try:
-            r = subprocess.run(
-                [*TMUX_CMD, "list-panes", "-t", pane_id, "-F",
-                 "#{pane_id}\t#{@claude_state}\t#{@claude_color}\t#{@claude_persona}"],
-                capture_output=True, timeout=0.5,
-            )
-            sibling_found = False
-            if r.returncode == 0:
-                for line in r.stdout.decode().splitlines():
-                    parts = line.split("\t")
-                    if len(parts) >= 2 and parts[0] != pane_id and parts[1]:
-                        # Sibling has claude state — promote to window level
-                        cls._run([*TMUX_CMD, "set", "-w", "-t", pane_id, "@claude_window_state", parts[1]])
-                        if len(parts) >= 3 and parts[2]:
-                            cls._run([*TMUX_CMD, "set", "-w", "-t", pane_id, "@claude_window_color", parts[2]])
-                        if len(parts) >= 4 and parts[3]:
-                            cls._run([*TMUX_CMD, "set", "-w", "-t", pane_id, "@claude_window_persona", parts[3]])
-                        sibling_found = True
-                        break
-            if not sibling_found:
-                for opt in ("@claude_window_state", "@claude_window_color", "@claude_window_persona", "@claude_window_hook", "@claude_window_voice", "@claude_window_focus", "@claude_window_agents"):
-                    cls._run([*TMUX_CMD, "set", "-wu", "-t", pane_id, opt])
-        except Exception:
-            # Fallback: just clear window options
-            for opt in ("@claude_window_state", "@claude_window_color", "@claude_window_persona", "@claude_window_hook", "@claude_window_voice", "@claude_window_focus", "@claude_window_agents"):
-                cls._run([*TMUX_CMD, "set", "-wu", "-t", pane_id, opt])
+        t = pane.pane_id
+        snapshot = cls._snapshot(t)
+        if snapshot is None:
+            return
+        current, siblings = snapshot
+        agents = ("◉" if pane.active_agent_count == 1 else f"◉{pane.active_agent_count}") \
+            if pane.active_agent_count > 0 else None
+        desired = [
+            ("p", "@claude_state_name", pane.state_name),
+            ("p", "@claude_state", pane.glyph),
+            ("p", "@claude_color", pane.color),
+            ("p", "@claude_persona", pane.persona or None),
+            ("p", "@claude_focus", pane.focus_emoji or None),
+            ("p", "@claude_agents", agents),
+        ]
+        if pane.hook_emoji:
+            desired.append(("p", "@claude_hook", pane.hook_emoji))
+        projected = dict(siblings.get(t, {}))
+        for scope, name, value in desired:
+            projected[name.removeprefix("@claude_")] = value
+        siblings[t] = projected
+        cls._apply(t, current, desired + cls._window_options(siblings))
+
+    @classmethod
+    def refresh_window(cls, pane_id: str) -> None:
+        """Recompute after focus or layout changes without changing pane state."""
+        snapshot = cls._snapshot(pane_id)
+        if snapshot is not None:
+            current, siblings = snapshot
+            cls._apply(pane_id, current, cls._window_options(siblings))
+
+    @classmethod
+    def clear_state(cls, pane_id: str) -> None:
+        """Clear lifecycle options and recompute the badge from live siblings."""
+        snapshot = cls._snapshot(pane_id)
+        if snapshot is None:
+            return
+        current, siblings = snapshot
+        siblings.pop(pane_id, None)
+        desired = [("p", "@claude_" + field, None) for field in cls._FIELDS]
+        cls._apply(pane_id, current, desired + cls._window_options(siblings))
 
     @staticmethod
     def pane_exists(pane_id: str) -> bool:
@@ -1453,6 +1481,12 @@ class TmuxArbiter:
         self.focus.DECAY_HALF_LIFE_INTENT = self.config.focus_decay_half_life_intent
         self.panes: dict[str, PaneState] = {}
         self.stream = StreamManager()
+        # Read current native lifecycle without restarting existing agents.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from agent_lifecycle import Collector as HarnessCollector, read_processes
+        from codex_lifecycle import Collector as CodexCollector
+        self.lifecycle_collectors = [HarnessCollector(), CodexCollector()]
+        self.lifecycle_process_reader = read_processes
         self._load()
         # Validate venture configuration on startup
         warnings = self.focus.validate_ventures()
@@ -1502,7 +1536,7 @@ class TmuxArbiter:
                             # Color mismatch on idle pane — normalize to canonical idle color.
                             pane = replace(pane, color=idle_color, glyph=idle_glyph)
                             corrected += 1
-                        elif pane.provider != "codex" and pane.state_name in ("working", "agents") and age_mins > STALE_WORKING_MINS:
+                        elif not pane.lifecycle_source and pane.provider != "codex" and pane.state_name in ("working", "agents") and age_mins > STALE_WORKING_MINS:
                             # Stale active state — clear to idle (Stop/SubagentStop never fired).
                             state_name, color, glyph = self.theme.resolve_event("Stop")
                             pane = replace(pane, state_name=state_name, color=color, glyph=glyph,
@@ -1617,6 +1651,7 @@ class TmuxArbiter:
                 history = self._record_event(pane, "PaneRead", "unread", state_name, "hook")
                 new_pane = replace(pane, state_name=state_name, color=color,
                                    glyph=glyph, updated_at=time.time(),
+                                   lifecycle_unread=False,
                                    last_source="hook", event_history=history)
                 self.panes[pane_id] = new_pane
                 TmuxWriter.write_state(new_pane)
@@ -1889,6 +1924,9 @@ class TmuxArbiter:
             focus_signals=[asdict(s) for s in self.focus._signals.get(pane_id, {}).values()],
             provider=provider,
             active_agent_count=new_depth if provider == "codex" else 0,
+            lifecycle_source=prev.lifecycle_source if prev else "",
+            lifecycle_identity=prev.lifecycle_identity if prev else "",
+            lifecycle_unread=state_name == "unread",
         )
 
         _log(f"transition: {pane_id} {prev_name} → {state_name} [{event}] depth={new_depth}")
@@ -1944,6 +1982,133 @@ class TmuxArbiter:
 
     # ---- Reconciliation ---------------------------------------------------
 
+    def reconcile_lifecycle(self) -> int:
+        """Project native, process-bound state. Quiet inference remains working.
+
+        An unreadable tmux inventory establishes no process exits. Missing
+        lifecycle evidence is unknown, never evidence that an agent is idle.
+        """
+        collectors = getattr(self, "lifecycle_collectors", ())
+        if not collectors:
+            return 0
+        try:
+            result = subprocess.run(
+                [*TMUX_CMD, "list-panes", "-a", "-F",
+                 "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_title}"],
+                capture_output=True, text=True, timeout=1,
+            )
+            if result.returncode:
+                return 0
+            inventory = {}
+            for line in result.stdout.splitlines():
+                values = line.split("\t", 3)
+                pane_id, pid, command = values[:3]
+                inventory[pane_id] = {"pid": int(pid), "command": command,
+                                      "title": values[3] if len(values) > 3 else ""}
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return 0
+
+        observed = {}
+        failed = False
+        try:
+            reader = getattr(self, "lifecycle_process_reader", None)
+            processes = reader() if reader else None
+        except Exception as exc:
+            _log(f"lifecycle process reader failed: {type(exc).__name__}")
+            failed = True
+        for collector in (() if failed else collectors):
+            try:
+                snapshot = collector.poll(inventory, processes=processes) if reader else collector.poll(inventory)
+                observed.update(snapshot)
+            except Exception as exc:
+                _log(f"lifecycle reader failed: {type(exc).__name__}")
+                failed = True
+        for pane_id, metadata in inventory.items():
+            command = metadata["command"]
+            if not failed and pane_id not in observed and command in {"claude", "codex", "pi", "omp"}:
+                process = processes.get(metadata["pid"]) if reader and not failed else None
+                observed[pane_id] = {"provider": command, "state": "unknown",
+                    "source": "native-metadata-unavailable", "process_id": metadata["pid"],
+                    "process_start": process.start if process else "", "session_id": ""}
+        now = time.time()
+        focused = self._get_focused_pane()
+        corrections = 0
+        for pane_id, evidence in observed.items():
+            if pane_id not in inventory:
+                continue
+            prev = self.panes.get(pane_id)
+            provider = evidence["provider"]
+            native_state = evidence.get("state", "unknown")
+            if native_state not in ("working", "idle", "asking", "error", "unknown"):
+                native_state = "unknown"
+            identity = ":".join(str(evidence.get(key, "")) for key in
+                                ("process_id", "process_start", "session_id"))
+            same_execution = bool(prev and prev.lifecycle_identity == identity)
+            state = native_state
+            hook_override = False
+            native_updated = evidence.get("updated_at", evidence.get("observed_at")) or 0
+            # A hook can expose a dialog before the transcript persists it.
+            if (same_execution and prev.last_source == "hook"
+                    and (prev.state_name in ("working", "agents", "asking")
+                         or provider == "claude" and prev.state_name in ("idle", "unread", "error"))
+                    and native_updated <= prev.updated_at):
+                state = prev.state_name
+                hook_override = True
+            elif (same_execution and state == "unknown" and prev.last_source == "hook"
+                    and now - prev.updated_at < self.config.hook_priority_secs):
+                state = prev.state_name
+                hook_override = True
+            elif same_execution and native_state == "idle":
+                if prev.state_name == "unread" or prev.lifecycle_unread:
+                    state = "idle" if pane_id == focused else "unread"
+                elif prev.state_name in ("working", "agents", "asking") and pane_id != focused:
+                    state = "unread"
+            _, color, glyph = self.theme.resolve_state(state)
+            source = evidence.get("source", "native")
+            if (prev and prev.state_name == state and prev.lifecycle_identity == identity
+                    and prev.lifecycle_source == source and prev.color == color and prev.glyph == glyph):
+                continue
+            history = self._record_event(prev, "native_lifecycle", prev.state_name, state, "reconcile") if prev else []
+            if prev:
+                pane = replace(prev, state_name=state, color=color, glyph=glyph,
+                               updated_at=prev.updated_at if hook_override else now,
+                               provider=provider, last_source="hook" if hook_override else "reconcile",
+                               lifecycle_source=source, lifecycle_identity=identity,
+                               lifecycle_unread=(state == "unread" or (same_execution
+                                   and state == "unknown" and prev.lifecycle_unread and pane_id != focused)),
+                               event_history=history,
+                               subagent_depth=prev.subagent_depth if state == "working" and same_execution else 0,
+                               active_agent_count=prev.active_agent_count if state == "working" and same_execution else 0)
+            else:
+                pane = PaneState(pane_id, state, color, glyph,
+                                 self.theme.get_persona_emoji(provider, self.emoji), now, 0,
+                                 provider=provider, last_source="reconcile",
+                                 lifecycle_source=source, lifecycle_identity=identity)
+            self.panes[pane_id] = pane
+            TmuxWriter.write_state(pane)
+            corrections += 1
+        for pane_id, prev in list(self.panes.items()):
+            if not prev.lifecycle_source or pane_id in observed:
+                continue
+            if failed:
+                # A failed reader does not prove an exit or a quiet model.
+                _, color, glyph = self.theme.resolve_state("unknown")
+                if prev.state_name != "unknown":
+                    pane = replace(prev, state_name="unknown", color=color, glyph=glyph, updated_at=now)
+                    self.panes[pane_id] = pane
+                    TmuxWriter.write_state(pane)
+                    corrections += 1
+            else:
+                # The pane may remain as a shell after its agent exits.
+                self.panes.pop(pane_id)
+                self.focus.clear_pane(pane_id)
+                if pane_id in inventory:
+                    TmuxWriter.clear_state(pane_id)
+                corrections += 1
+        if corrections:
+            self._persist()
+        return corrections
+
     def reconcile(self) -> int:
         """Check all tracked panes for drift. Returns count of corrections.
 
@@ -1978,6 +2143,12 @@ class TmuxArbiter:
                 del self.panes[pane_id]
                 self.stream.detach(pane_id)
                 corrections += 1
+                continue
+
+            if pane.lifecycle_source:
+                # Native lifecycle is authoritative for these panes. Repair
+                # projection drift without CPU-based working/idle guesses.
+                TmuxWriter.write_state(pane)
                 continue
 
             # Clear stale working/agents states.
@@ -2235,10 +2406,15 @@ class ArbiterServer:
     async def _main_loop(self) -> None:
         """Main loop — runs reconciliation on a timer."""
         _reconcile_count = 0
+        last_reconcile = 0.0
         while self._running:
-            await asyncio.sleep(self.arbiter.config.reconcile_interval)
+            await asyncio.sleep(min(1.0, self.arbiter.config.reconcile_interval))
             if not self._running:
                 break
+            self.arbiter.reconcile_lifecycle()
+            if time.monotonic() - last_reconcile < self.arbiter.config.reconcile_interval:
+                continue
+            last_reconcile = time.monotonic()
             corrections = self.arbiter.reconcile()
             _reconcile_count += 1
             if corrections > 0 or _reconcile_count % 100 == 0:
@@ -2300,6 +2476,15 @@ class ArbiterServer:
 
         elif msg_type == "status":
             return self.arbiter.get_status()
+
+        elif msg_type == "window_refresh":
+            pane_id = msg.get("pane", "")
+            if not re.fullmatch(r"%\d+", pane_id):
+                return {"type": "error", "message": "invalid pane"}
+            if msg.get("mark_read") is True:
+                self.arbiter.apply_event("PaneRead", pane_id, {})
+            TmuxWriter.refresh_window(pane_id)
+            return {"type": "window_refresh_ack"}
 
         elif msg_type == "shutdown":
             _log("shutdown via IPC")
