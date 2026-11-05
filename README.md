@@ -86,6 +86,9 @@ Timing, decay half-lives, emoji slots, and the optional shared-vault person attr
 
 ## Status ownership and recovery
 
+The [2026-11-04 false working incident](docs/incidents/2026-11-04-false-working-state.md)
+records the failure chain, attribution limits, corrective commit and verification.
+
 Native lifecycle metadata establishes which live process and session owns a
 pane. The arbiter combines that evidence with validated hooks, persists a
 derived cache, and projects pane and window options into tmux. The window
