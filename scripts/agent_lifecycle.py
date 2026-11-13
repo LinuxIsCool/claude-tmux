@@ -90,8 +90,10 @@ def _provider(process: Process) -> str | None:
 
 def outer_harness_processes(root_pid: int, processes: dict[int, Process]) -> list[Process]:
     """The outer supported harness owns its pane across provider collectors."""
+    # Linux appends this marker while a live process uses a replaced binary.
     candidates = [p for p in pane_processes(root_pid, processes)
-        if _provider(p) or (Path(p.exe).name == "codex" and "app-server" not in p.args)]
+        if _provider(p) or (Path(p.exe.removesuffix(" (deleted)")).name == "codex"
+                           and "app-server" not in p.args)]
     candidate_ids = {p.pid for p in candidates}
     result = []
     for candidate in candidates:

@@ -90,6 +90,17 @@ def test_abort_and_partial_append_are_incremental(native):
     assert poll(native)["%1"]["state"] == "idle"
 
 
+def test_live_replaced_executable_preserves_identity_and_turn_boundaries(native):
+    path = native.rollout(events=row("task_started"))
+    native.processes[30].exe = "/bin/codex (deleted)"
+    active = poll(native)["%1"]
+    assert (active["state"], active["session_id"], active["process_id"]) == ("working", ROOT, 30)
+    with path.open("a") as handle:
+        handle.write(row("task_complete", "2026-11-03T12:02:00Z"))
+    completed = poll(native)["%1"]
+    assert (completed["state"], completed["session_id"], completed["process_id"]) == ("idle", ROOT, 30)
+
+
 def test_partial_new_turn_cannot_preserve_previous_idle(native):
     path = native.rollout(events=row("task_complete"))
     assert poll(native)["%1"]["state"] == "idle"

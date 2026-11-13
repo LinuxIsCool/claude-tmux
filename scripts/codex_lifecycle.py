@@ -235,7 +235,7 @@ class Collector:
             owners = outer_harness_processes(shell, processes)
             # A nested CLI is a tool owned by its outer harness. Both provider
             # collectors use this same ownership decision before projecting.
-            if (len(owners) != 1 or Path(owners[0].exe).name != "codex"
+            if (len(owners) != 1 or Path(owners[0].exe.removesuffix(" (deleted)")).name != "codex"
                     or "app-server" in owners[0].args):
                 continue
             result = {"provider": "codex", "state": "unknown", "source": "codex-native-rollout"}
